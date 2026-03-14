@@ -1,0 +1,2202 @@
+```{r}
+# bookdown::render_book("index.Rmd", "bookdown::gitbook")
+```
+
+# Figure 1: Integration of Ex Vivo Drug Screening and Transcriptomics
+
+This chapter describes a comprehensive analysis integrating ex vivo cytarabine (Ara-C) response profiles with transcriptomic data from AML patient cohorts, including BeatAML and RJAML. The goal is to identify predictive biomarkers of Ara-C sensitivity and characterize gene expression/pathway enrichment differences between clinical response groups.
+
+## Ara-C Response Profiling in BeatAML
+
+We first assessed the distribution of Ara-C sensitivity across patients using the BeatAML dataset. Patients were classified into sensitivity groups based on the z-score transformed area under the curve (AUC) values for cytarabine.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r plot-arac-sensitivity-distribution, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+
+sample1 <- read.csv("../02.data/BeatAML_AraC_value_sampleInfo.csv", header = TRUE)
+sample1$z_auc <- scale(sample1$auc)
+sample1$group <- ifelse(sample1$z_auc < 0, "Sensitive", "Resistant")
+
+# Visualize the distribution using ggplot2
+p <- ggplot(sample1, aes(x = z_auc)) +
+  geom_histogram(binwidth = 0.3, fill = "#3182bd", color = "black") +
+  labs(
+    title = "Distribution of Ara-C Sensitivity (Z-scored AUC)",
+    x = "Z-Scaled AUC", y = "Number of Patients"
+  ) +
+  theme_minimal(base_size = 13)
+
+p
+
+ggsave(p, filename = "../03.out/figure1/beataml_auc_zscore.pdf", width = 5.4, height = 5)
+```
+
+## Identifying Ara-C-Responsive Genes by Partial Correlation
+
+To identify genes whose expression levels are associated with cytarabine sensitivity, we calculated partial correlations between gene expression and Ara-C AUC, adjusting for bone marrow blast percentage.
+
+```{r partial-correlation-analysis, eval=FALSE, message = FALSE, warning = FALSE}
+# Load libraries
+library(pbapply)
+library(dplyr)
+library(tibble)
+library(readr)
+library(stringr)
+library(stats)
+
+# ========== 1. Load and preprocess metadata ==========
+# Load AUC info
+sample_info <- read_csv("../02.data/BeatAML_AraC_value_sampleInfo.csv")
+
+arac <- sample_info %>%
+  select(Sample, auc) %>%
+  rename(AraC_AUC = auc) %>%
+  column_to_rownames("Sample")
+
+# Load BM blast data
+bm_blast <- read.table("../02.data/beataml_bm_blasts.txt", header = TRUE) %>%
+  arrange(Sample) %>%
+  column_to_rownames("Sample")
+
+# ========== 2. Load and filter expression matrix ==========
+exp_raw <- read.table("../02.data/BeatAML_all_735_TPM_matrix.txt", header = TRUE, row.names = 1)
+
+# Keep only meaningful gene types
+valid_types <- c(
+  "protein_coding", "antisense", "lincRNA", "3prime_overlapping_ncrna",
+  "macro_lncRNA", "non_coding", "processed_transcript", "TEC", "scaRNA",
+  "sense_intronic", "sense_overlapping", "transcribed_processed_pseudogene",
+  "transcribed_unitary_pseudogene", "transcribed_unprocessed_pseudogene",
+  "unprocessed_pseudogene"
+)
+
+exp_filtered <- exp_raw %>%
+  filter(Type %in% valid_types)
+
+# Get common samples
+common_samples <- Reduce(intersect, list(colnames(exp_filtered)[-c(1:2)], rownames(arac), rownames(bm_blast)))
+
+# Subset and log2-transform expression
+exp_log2 <- exp_filtered[, common_samples, drop = FALSE] %>%
+  as.matrix() %>%
+  t() %>%
+  { log2(. + 1) }
+
+# Keep genes with ≥25% non-NA and non-zero variance
+exp_log2 <- exp_log2[, apply(exp_log2, 2, function(x) {
+  sum(!is.na(x)) >= (0.25 * length(x)) && sd(x, na.rm = TRUE) > 0
+})]
+
+# Ensure sample order consistency
+exp_log2 <- exp_log2[common_samples, ]
+arac <- arac[common_samples, , drop = FALSE]
+bm_blast <- bm_blast[common_samples, , drop = FALSE]
+
+# ========== 3. Define partial correlation function ==========
+partial_correlation <- function(gene_exp, auc, blast) {
+  df <- na.omit(data.frame(Gene = gene_exp, AraC_AUC = auc, BM_Blast = blast))
+  if (nrow(df) <= 2) return(c(NA, NA))
+  
+  r12 <- cor(df$Gene, df$AraC_AUC)
+  r13 <- cor(df$Gene, df$BM_Blast)
+  r23 <- cor(df$AraC_AUC, df$BM_Blast)
+  
+  denom <- sqrt((1 - r13^2) * (1 - r23^2))
+  if (is.na(denom) || denom == 0) return(c(NA, NA))
+  
+  partial_r <- (r12 - r13 * r23) / denom
+  stat <- partial_r * sqrt((nrow(df) - 3) / (1 - partial_r^2))
+  pval <- 2 * pnorm(-abs(stat))
+  
+  return(c(partial_r, pval))
+}
+
+# ========== 4. Apply to all genes ==========
+results <- pblapply(seq_len(ncol(exp_log2)), function(i) {
+  partial_correlation(exp_log2[, i], arac$AraC_AUC, bm_blast$BM_Blast)
+})
+
+pcor_matrix <- do.call(rbind, results)
+
+# ========== 5. Assemble results ==========
+results_df <- tibble(
+  Gene = colnames(exp_log2),
+  PearsonRho = pcor_matrix[, 1],
+  P.Value = pmin(pcor_matrix[, 2], 1)
+) %>%
+  mutate(
+    FDR = p.adjust(P.Value, method = "BH")
+  )
+
+# Compute Z-score only for non-NA PearsonRho
+results_df$Z_score <- NA
+valid_idx <- which(!is.na(results_df$PearsonRho))
+results_df$Z_score[valid_idx] <- scale(results_df$PearsonRho[valid_idx])[, 1]
+
+# Compute AraCRS 
+results_df <- results_df %>%
+  mutate(
+    AraCRS = ifelse(is.na(Z_score), NA, -log2(FDR + 1e-40) * abs(Z_score))
+  )
+
+# ========== 6. Add gene annotation ==========
+gene_anno <- exp_filtered[, c("Symbol", "Type")] %>%
+  rownames_to_column("Gene")
+
+results_df <- left_join(results_df, gene_anno, by = "Gene")
+
+# View top ranked genes
+results_df <- arrange(results_df, desc(AraCRS))
+
+# Save to file
+# write_csv(results_df, "../02.data/BeatAML_AraC_AUC_Gene_Corr.csv")
+
+```
+
+## Visualization of Gene-AraC Correlation Results
+
+```{r plot-partial-correlation-results, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(readr)
+library(ggrastr)
+
+# Load the data
+df <- read_csv("../02.data/BeatAML_AraC_AUC_Gene_Corr.csv")
+
+# Define genes to label
+genes_to_label <- c(
+  "GAS6-AS2", "SLC29A1", "CDA", "PCBP3", "TUFT1", "DCK", "TM4SF19-AS1",
+  "RP11-434H6.6", "RAB43", "LAMC1", "RP11-1029J19.5", "DCTD", "UBA6-AS1",
+  "CHEK2", "RP11-162D16.2", "LDLRAD2", "FAM166B", "S100A1"
+)
+
+# Rank by Z_score
+df_ranked <- df %>%
+  arrange(desc(Z_score)) %>%
+  mutate(
+    rank = row_number(),
+    abs_z = abs(Z_score),
+    is_labeled = Symbol %in% genes_to_label,
+    label = ifelse(is_labeled, Symbol, NA)
+  )
+
+# Get Z-score cutoffs for top and bottom 1000 genes
+top_1000_cutoff <- df_ranked$Z_score[1000]
+bottom_1000_cutoff <- df_ranked$Z_score[nrow(df_ranked) - 999]
+
+# Create plot
+p <- ggplot(df_ranked, aes(x = rank, y = Z_score)) +
+  # Main colored points
+  geom_point_rast(aes(size = abs_z, color = Z_score), alpha = 0.8) +
+
+  # Black outline circles (same size) on labeled genes
+  geom_point(
+    data = df_ranked %>% filter(is_labeled),
+    aes(size = abs_z),
+    shape = 21, stroke = 0.8, fill = NA, color = "black"
+  ) +
+
+  # Text labels
+  geom_text_repel(
+    data = df_ranked %>% filter(is_labeled),
+    aes(label = Symbol),
+    size = 3,
+    max.overlaps = Inf
+  ) +
+
+  # Horizontal dashed lines for top/bottom 1000 gene Z-score cutoffs
+  geom_hline(yintercept = c(top_1000_cutoff, bottom_1000_cutoff),
+             linetype = "dashed", color = "grey40") +
+
+  # Scales and themes
+  scale_color_distiller(palette = "PRGn", direction = -1) +
+  scale_size_continuous(range = c(1, 4)) +
+  labs(
+    x = "Gene Rank (by Z-score)",
+    y = "Z-score",
+    color = "Z-score",
+    size = "|Z-score|"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p
+
+# ggsave(p, filename = "../03.out/figure1/01.gene_arac_dotplot_beataml.pdf", width = 6.5, height = 5.4)
+```
+
+## Processing the CRISPRa data from the 2018 Cell paper
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(readxl)
+library(tidyverse)
+library(glue)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ggrepel)
+library(ggrastr)
+library(patchwork)
+
+# Define constants
+abundance_cols <- c("d0_ctrl1", "d0_ctrl2", "d14_arac1", "d14_arac2")
+
+# General-purpose CRISPRa processing function
+process_crispr_sheet <- function(file, sheet, id_col, keytype = NULL, map_to_symbol = TRUE) {
+  message(glue("Processing sheet {sheet}..."))
+
+  df <- read_xlsx(file, sheet = sheet)
+
+  # Normalize to CPM
+  df <- df %>%
+    mutate(across(all_of(abundance_cols), ~ .x / sum(.x, na.rm = TRUE) * 1e6))
+
+  # Map to gene symbols if required
+  if (map_to_symbol) {
+    df$Symbol <- mapIds(
+      org.Hs.eg.db,
+      keys = df[[id_col]],
+      column = "SYMBOL",
+      keytype = keytype,
+      multiVals = "first"
+    )
+    df <- df %>% filter(!is.na(Symbol))
+  } else {
+    df <- df %>% mutate(Symbol = .data[[id_col]])
+  }
+
+  # Aggregate by symbol and calculate CRISPR score (log2 fold-change)
+  df_agg <- df %>%
+    group_by(Symbol) %>%
+    summarise(across(all_of(abundance_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(CRISPR_score = log2(
+      pmax(rowMeans(across(starts_with("d14")), na.rm = TRUE), 1e-6) /
+      pmax(rowMeans(across(starts_with("d0_")), na.rm = TRUE), 1e-6)
+    ))
+
+  return(df_agg)
+}
+
+# Wrapper function to create dot plots
+plot_crispr_dot <- function(df, title) {
+  ranked <- df %>%
+    arrange(desc(CRISPR_score)) %>%
+    mutate(
+      rank = row_number(),
+      abs_score = abs(CRISPR_score)
+    )
+
+  label_genes <- ranked %>%
+    slice_head(n = 50) %>%
+    bind_rows(slice_tail(ranked, n = 50))
+
+  ggplot(ranked, aes(x = rank, y = CRISPR_score)) +
+    geom_point_rast(aes(size = abs_score, color = CRISPR_score), alpha = 0.8) +
+    geom_text_repel(
+      data = label_genes,
+      aes(label = Symbol),
+      size = 2,
+      max.overlaps = Inf
+    ) +
+    scale_color_distiller(palette = "BrBG", direction = 1) +
+    scale_size_continuous(range = c(1, 4)) +
+    labs(
+      title = title,
+      x = "Gene Rank (by CRISPR Score)",
+      y = "CRISPR Score",
+      color = "CRISPR Score",
+      size = "|CRISPR Score|"
+    ) +
+    theme_classic(base_size = 14)
+}
+
+# Input file path
+file_path <- "../02.data/Cell_2018_CRISPRa.xlsx"
+
+# Process protein-coding genes (Sheet 1, RefSeq ID)
+crispr_protein_coding <- process_crispr_sheet(
+  file = file_path,
+  sheet = 1,
+  id_col = "Gene",
+  keytype = "REFSEQ",
+  map_to_symbol = TRUE
+)
+
+# Process non-coding genes (Sheet 2, use gene_id as symbol)
+crispr_noncoding <- process_crispr_sheet(
+  file = file_path,
+  sheet = 2,
+  id_col = "Gene",
+  map_to_symbol = FALSE
+)
+
+# Generate plots
+p1 <- plot_crispr_dot(crispr_protein_coding, "Ara-C Responsive Protein-Coding Genes")
+p2 <- plot_crispr_dot(crispr_noncoding, "Ara-C Responsive Non-Coding Genes")
+
+plots <- p1 + p2
+
+plots
+
+ggsave(plots, filename = "../03.out/figure1/CRISPRa_dotplots.pdf", width = 13, height = 5)
+
+# Optional: save results
+# write_csv(crispr_protein_coding, "../02.data/CRISPRa_protein_coding.csv")
+# write_csv(crispr_noncoding, "../02.data/CRISPRa_noncoding.csv")
+```
+
+## Define the AraCRS (Ara-C Response Score) to predict functional Ara-C modulators 
+We defined the top identified genes by CRISPR activation screen as the Ara-C Responsive Genes (Responsive) and the others as the NonResponsive group. Then we compare their AraCRS.
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+# Load libraries
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+# Step 1: Select top 50 sensitive and resistant genes based on CRISPR scores
+top_n <- 50
+
+# Sort and select protein-coding genes
+sensitive_gene <- crispr_protein_coding %>%
+  arrange(CRISPR_score) %>%
+  slice_head(n = top_n) %>%
+  mutate(type = "Sensitive")
+
+resistant_gene <- crispr_protein_coding %>%
+  arrange(desc(CRISPR_score)) %>%
+  slice_head(n = top_n) %>%
+  mutate(type = "Resistant")
+
+# Sort and select non-coding genes
+sensitive_nonc <- crispr_noncoding %>%
+  arrange(CRISPR_score) %>%
+  slice_head(n = top_n) %>%
+  mutate(type = "Sensitive")
+
+resistant_nonc <- crispr_noncoding %>%
+  arrange(desc(CRISPR_score)) %>%
+  slice_head(n = top_n) %>%
+  mutate(type = "Resistant")
+
+# Combine sensitive and resistant genes
+arac_responsive_gene <- bind_rows(sensitive_gene, resistant_gene, sensitive_nonc, resistant_nonc) %>%
+  dplyr::select(Symbol, type)  # Keep only necessary columns
+# write.csv(arac_responsive_gene, "../02.data/arac_responsive_gene_top200.csv")
+
+# Step 2: Load Rank_score matrix and label responsive vs non-responsive genes
+gene_corr_mat <- read_csv("../02.data/BeatAML_AraC_AUC_Gene_Corr.csv")
+
+mat_labeled <- gene_corr_mat %>%
+  left_join(arac_responsive_gene, by = "Symbol") %>%
+  mutate(type = replace_na(type, "NonResponsive"),
+         type = if_else(type != "NonResponsive", "Responsive", "NonResponsive"))
+
+# Step 3: Compute ROC
+
+roc_obj <- roc(response = mat_labeled$type,
+               predictor = mat_labeled$AraCRS,
+               levels = c("NonResponsive", "Responsive"),
+               direction = "<") # Higher AraCRS values indicates responsiveness
+
+# Step 4: Compute AUC and 95% CI
+auc_val <- auc(roc_obj)
+ci_auc <- ci.auc(roc_obj)
+
+# Step 5: Manual one-sample Z-test (test if AUC > 0.5)
+n1 <- sum(mat_labeled$type == "Responsive")
+n2 <- sum(mat_labeled$type == "NonResponsive")
+
+q1 <- auc_val / (2 - auc_val)
+q2 <- (2 * auc_val^2) / (1 + auc_val)
+se_auc <- sqrt((auc_val * (1 - auc_val) +
+                (n1 - 1) * (q1 - auc_val^2) +
+                (n2 - 1) * (q2 - auc_val^2)) / (n1 * n2))
+
+z_score <- (auc_val - 0.5) / se_auc
+p_value_auc <- 2 * pnorm(-abs(z_score))  # two-sided
+
+# Format text to display
+auc_ci_text <- paste0("AUC = ", round(auc_val, 3),
+                      " [", round(ci_auc[1], 3), "-", round(ci_auc[3], 3), "]")
+pval_text <- paste("P-value =", formatC(p_value_auc, format = "e", digits = 2))
+
+# Get optimal cutoff (Youden's index)
+opt_cut <- coords(roc_obj, "best", ret = "threshold", transpose = FALSE)
+
+# Step 6: Plot ROC curve
+roc_plot <- ggroc(roc_obj, linewidth = 1.2, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  
+  # Annotate cutoff, AUC with CI, and p-value
+  annotate("text", x = 0.6, y = 0.3,
+           label = paste("Optimal cutoff:", round(opt_cut, 3)),
+           size = 5, color = "darkred") +
+  
+  annotate("text", x = 0.6, y = 0.2,
+           label = auc_ci_text,
+           size = 5, color = "black") +
+
+  annotate("text", x = 0.6, y = 0.1,
+           label = pval_text,
+           size = 5, color = "black") +
+
+  labs(
+    title = "ROC Curve for AraC Response Prediction",
+    x = "1 - Specificity", y = "Sensitivity"
+  ) +
+  theme_classic(base_size = 14)
+
+roc_plot
+
+gene_corr_mat$group <- ifelse(gene_corr_mat$AraCRS > as.numeric(opt_cut), "Selected", "Non")
+table(gene_corr_mat$group)
+
+```
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Set factor levels for consistent ordering
+mat_labeled <- mat_labeled %>%
+  mutate(type = factor(type, levels = c("NonResponsive", "Responsive")))
+
+# Compute group-wise mean and SEM for AraCRS
+summary_df <- mat_labeled %>%
+  group_by(type) %>%
+  summarise(
+    mean = mean(AraCRS, na.rm = TRUE),
+    sem = sd(AraCRS, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Perform Wilcoxon rank-sum test
+wilcox_p <- wilcox.test(AraCRS ~ type, data = mat_labeled)$p.value
+p_label <- paste0("Wilcoxon test, p = ", formatC(wilcox_p, format = "e", digits = 2))
+
+# Generate bar plot with mean ± SEM
+p <- ggplot(summary_df, aes(x = type, y = mean, fill = type)) +
+  geom_bar(stat = "identity", width = 0.6, color = "black", alpha = 0.85) +
+  geom_errorbar(
+    aes(ymin = mean - sem, ymax = mean + sem),
+    width = 0.3, size = 0.8
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(summary_df$mean + summary_df$sem) * 1.05,
+    label = p_label,
+    size = 4,
+    fontface = "italic"
+  ) +
+  scale_fill_manual(values = c("NonResponsive" = "#E69F00", "Responsive" = "#56B4E9")) +
+  labs(
+    x = "Response Type",
+    y = "AraC Response Score (AraCRS)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10))
+  )
+
+p
+
+ggsave(p, filename = "../03.out/figure1/04.CRISPRa_boxplot.pdf", width = 3, height = 4)
+```
+
+### Define Ara-C responsive genes
+
+```{r}
+# Define resistance and sensitivity genes
+resistance_genes <- df_ranked %>% 
+  filter(Z_score >= top_1000_cutoff) %>%
+  mutate(category = "AraC_Resistance")
+
+sensitivity_genes <- df_ranked %>%
+  filter(Z_score <= bottom_1000_cutoff) %>%
+  mutate(category = "AraC_Sensitivity")
+
+# Combine and optionally save or inspect
+araC_gene_sets <- bind_rows(resistance_genes, sensitivity_genes)
+
+# write_csv(araC_gene_sets, "../02.data/AraC_TopBottom1000_Genes.csv")
+```
+
+## Identification of AraC-Associated Genes Using CCLE Datasets
+
+To extend our analysis across cancer cell lines, we integrated RNA-seq data and Ara-C sensitivity profiles from the Cancer Cell Line Encyclopedia (CCLE). We assessed gene-drug correlations and visualized representative AraC-correlated genes across multiple lineages.
+
+```{r plot-ccle-correlation-landscape, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(readr)
+library(ggrastr)
+
+# Load datasets
+ccle_auc <- read.csv("../02.data/GDSC1_RNA-seq_AraC_AUC.csv")
+
+# Histogram of Ara-C sensitivity
+p_hist <- ggplot(ccle_auc, aes(x = Z_SCORE)) +
+  geom_histogram(binwidth = 0.3, fill = "#3182bd", color = "black") +
+  labs(
+    x = "Z-Scaled AUC (Ara-C Sensitivity)",
+    y = "Number of Cell Lines",
+    title = "Distribution of Ara-C Sensitivity Across CCLE"
+  ) +
+  theme_minimal()
+
+p_hist
+ggsave(p_hist, filename = "../03.out/figure1/gene_arac_hist_ccle.pdf", width = 5.4, height = 5)
+
+# Prepare correlation data for plotting
+# Load the data
+ccle_df <- read.csv("../02.data/CCLE_CorrOut.csv")
+
+# Define genes to label
+genes_to_label <- c(
+  "TUFT1", "ZBP1", "SETBP1", "CDA", "MUL1", "CXCL17", "RMDN2-AS1",
+  "DCK", "SLC29A1", "CHEK2", "DCTD", "GADD45G", "ATP6V0A1", "CLDN3",
+  "RP11-794G24.1", "NPM3", "NAP1L1", "ITPRIP", "RPL14", "LINC01222"
+)
+
+# Rank and annotate
+ccle_ranked <- ccle_df %>%
+  arrange(desc(Z_score)) %>%
+  mutate(
+    rank = row_number(),
+    abs_z = abs(Z_score),
+    is_labeled = Symbol %in% genes_to_label,
+    label = ifelse(is_labeled, Symbol, NA)
+  )
+
+# Get Z-score cutoffs
+top1000_z_ccle <- ccle_ranked$Z_score[1000]
+tail1000_z_ccle <- ccle_ranked$Z_score[nrow(ccle_ranked) - 999]
+
+# Plot CCLE Z-score ranking
+p_ccle <- ggplot(ccle_ranked, aes(x = rank, y = Z_score)) +
+  geom_point_rast(aes(size = abs_z, color = Z_score), alpha = 0.8) +
+  geom_point(
+    data = filter(ccle_ranked, is_labeled),
+    aes(size = abs_z), shape = 21, stroke = 0.8, fill = NA, color = "black"
+  ) +
+  geom_text_repel(
+    data = filter(ccle_ranked, is_labeled),
+    aes(label = Symbol),
+    size = 3, max.overlaps = Inf
+  ) +
+  geom_hline(yintercept = c(top1000_z_ccle, tail1000_z_ccle),
+             linetype = "dashed", color = "grey40") +
+  scale_color_distiller(palette = "PRGn", direction = -1) +
+  scale_size_continuous(range = c(1, 4)) +
+  labs(
+    title = "Ara-C-Responsive Genes in CCLE Cell Lines (In vitro)",
+    x = "Gene Rank (by Z-score)",
+    y = "Z-score",
+    color = "Z-score",
+    size = "|Z-score|"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_ccle
+
+ggsave(p_ccle, filename = "../03.out/figure1/gene_arac_dotplot_ccle.pdf", width = 6.5, height = 5.4)
+```
+
+## Top genes overlap
+
+```{r}
+library(ggvenn)
+library(tidyverse)
+
+patient_df <- read_csv("../02.data/BeatAML_AraC_AUC_Gene_Corr.csv")
+ccle_df <- read.csv("../02.data/CCLE_CorrOut.csv")
+ccle_df <- ccle_df[!duplicated(ccle_df$Symbol), ]
+# Rank both
+top_bottom_genes <- function(df) {
+  df <- df %>% arrange(desc(Z_score))
+  top1000 <- df$Symbol[1:1000]
+  bottom1000 <- df$Symbol[(nrow(df) - 999):nrow(df)]
+  unique(na.omit(c(top1000, bottom1000)))
+}
+
+genes_patient <- top_bottom_genes(patient_df)
+genes_ccle <- top_bottom_genes(ccle_df)
+
+gene_sets <- list(
+  Patient = genes_patient,
+  CCLE = genes_ccle
+)
+
+# Create Venn plot with ggvenn
+p_venn <- ggvenn(
+  gene_sets,
+  fill_color = c("#E69F00", "#56B4E9"),
+  stroke_size = 0.5,
+  set_name_size = 5,
+  text_size = 4
+)
+p_venn
+# Define gene universe = genes that exist in both datasets
+gene_universe <- intersect(patient_df$Symbol, ccle_df$Symbol)
+
+# Logical vectors for membership
+in_patient <- gene_universe %in% genes_patient
+in_ccle <- gene_universe %in% genes_ccle
+
+# Contingency table and p-value
+contingency <- table(Patient = in_patient, CCLE = in_ccle)
+fisher_p <- fisher.test(contingency)$p.value
+p_label <- paste0("Fisher's Exact Test\np = ", formatC(fisher_p, format = "e", digits = 2))
+p_label
+
+ggsave(p_venn, filename = "../03.out/figure1/arac_genes_overlap.pdf", width = 5, height = 5)
+
+```
+
+## Ex vivo screens in the Functional Precision Medicine Tumor Board AML
+
+```{r fpmtb_normalize_tpm, eval=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+
+# -------------------------------
+# Load data
+# -------------------------------
+count_df <- read_csv("../02.data/File_8_RNA_seq_Raw_Reads_163S_4Healthy.csv") %>%
+  rename(id2 = 1)
+
+gene_length_df <- read_csv("../02.data/gencode.v22_geneLength.csv")
+
+# -------------------------------
+# Merge gene length with expression counts
+# -------------------------------
+merged_df <- inner_join(gene_length_df, count_df, by = "id2")
+
+# Extract count matrix and corresponding gene lengths
+count_mat <- merged_df %>%
+  column_to_rownames("id2") %>%
+  select(-(1:4))
+
+length_vec <- merged_df %>%
+  select(id2, length) %>%
+  column_to_rownames("id2") %>%
+  pull(length)
+
+# -------------------------------
+# Calculate TPM
+# -------------------------------
+# Convert to matrix for vectorized math
+count_mat_numeric <- as.matrix(count_mat)
+
+# TPM calculation: Normalize for gene length and library size
+TPM <- t(t(count_mat_numeric / length_vec) * 1e6 / colSums(count_mat_numeric / length_vec))
+
+# Convert TPM matrix back to tibble
+TPM_df <- as_tibble(TPM, rownames = "id2") %>%
+  left_join(select(gene_length_df, id2, Symbol, Type), by = "id2") %>%
+  relocate(Symbol, Type)
+
+# -------------------------------
+# Load drug profiling data
+# -------------------------------
+drug_df <- read_csv("../02.data/File_3_Drug_response_sDSS_164S_17Healthy.csv")
+
+# -------------------------------
+# Find shared samples and filter data
+# -------------------------------
+shared_samples <- intersect(colnames(TPM_df), colnames(drug_df))
+
+tpm_filtered <- TPM_df %>%
+  select(id2, Symbol, Type, all_of(shared_samples))
+
+count_filtered <- count_mat_numeric[, shared_samples]
+
+drug_filtered <- drug_df %>%
+  select(Drug_name, all_of(shared_samples))
+
+# -------------------------------
+# Extract 7+3 chemotherapy drugs
+# -------------------------------
+chemo_drugs <- c("Cytarabine", "Daunorubicin", "Idarubicin")
+
+chemo_df <- drug_filtered %>%
+  filter(Drug_name %in% chemo_drugs) %>%
+  column_to_rownames("Drug_name")
+
+# -------------------------------
+# Write outputs
+# -------------------------------
+# write.csv(count_filtered, "../02.data/fpmtb_drug_gene_count.csv")
+# write.csv(tpm_filtered, "../02.data/fpmtb_drug_gene_tpm.csv")
+# write.csv(chemo_df, "../02.data/fpmtb_chemo_drug_sensitivity.csv")
+
+```
+
+### Unsupervised clustering for "Ara-C + Idarubicin" (2 major groups)
+
+```{r}
+# -------------------------------
+# Load required libraries
+# -------------------------------
+library(pheatmap)
+library(ggpubr)
+library(dplyr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+library(ggbeeswarm)
+
+# -------------------------------
+# Load and subset drug sensitivity matrix
+# -------------------------------
+core_mat <- read.csv("../02.data/fpmtb_chemo_drug_sensitivity.csv", row.names = 1)
+selected_drugs <- c("Cytarabine", "Idarubicin")
+core_mat_sub <- core_mat[selected_drugs, ]
+
+# Convert to matrix and scale
+core_mat_scaled <- as.matrix(core_mat_sub)
+
+# Define color scale
+heat_colors <- colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100)
+
+# -------------------------------
+# First heatmap clustering to assign labels
+# -------------------------------
+heat_result <- pheatmap(
+  core_mat_scaled,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "row",
+  cutree_cols = 2,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  border_color = "black",
+  clustering_method = "ward.D"
+)
+
+# -------------------------------
+# Extract clustering and assign labels
+# -------------------------------
+# Assign cluster from pheatmap
+sample_cluster <- data.frame(
+  Sample = colnames(core_mat_scaled),
+  Cluster = cutree(heat_result$tree_col, k = 2)
+)
+
+# Calculate mean sDSS per sample (Cytarabine + Idarubicin)
+sample_cluster$Mean_sDSS <- colMeans(core_mat_scaled)
+
+# Determine which cluster is more sensitive (higher sDSS)
+cluster_avg <- sample_cluster %>%
+  group_by(Cluster) %>%
+  summarize(Avg_sDSS = mean(Mean_sDSS)) %>%
+  arrange(desc(Avg_sDSS)) %>%
+  mutate(Label = c("Sensitive", "Resistant"))
+
+# Merge back to assign labels
+sample_cluster <- sample_cluster %>%
+  left_join(cluster_avg, by = "Cluster") %>%
+  dplyr::select(Sample, Cluster, Label) %>%
+  column_to_rownames("Sample")
+
+# Prepare for heatmap annotation
+annotation_col <- data.frame(Label = factor(sample_cluster$Label))
+rownames(annotation_col) <- rownames(sample_cluster)
+
+ann_colors <- list(
+  Label = c("Sensitive" = "#e9b383", "Resistant" = "#7c9d97")
+)
+
+# -------------------------------
+# Final annotated heatmap
+# -------------------------------
+pdf("../03.out/figure1/fpmtb_exVivo_arac_ida_heatmap.pdf", width = 10, height = 4)
+pheatmap(
+  core_mat_scaled,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  cutree_cols = 2,
+  scale = "row",
+  border_color = "black",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  clustering_method = "ward.D"
+)
+dev.off()
+
+# -------------------------------
+# Boxplot of drug sensitivity by cluster
+# -------------------------------
+# Prepare long-format data
+drug_df <- as.data.frame(t(core_mat_sub)) %>%
+  rownames_to_column("Sample") %>%
+  left_join(sample_cluster %>% rownames_to_column("Sample"), by = "Sample") %>%
+  pivot_longer(
+    cols = all_of(selected_drugs),
+    names_to = "Drug",
+    values_to = "sDSS"
+  )
+
+# Reorder drug factor levels
+drug_df$Drug <- factor(drug_df$Drug, levels = selected_drugs)
+
+# Plot
+boxplot_fig <- ggplot(drug_df, aes(x = Label, y = sDSS, color = Label)) +
+  geom_boxplot_jitter(width = 0.5, alpha = 0.8, outlier.shape = NA) +
+  geom_quasirandom(width = 0.15, alpha = 0.75) +
+  facet_wrap(~Drug, ncol = 2) +
+  theme_pubr() +
+  labs(x = NULL, y = "Drug sensitivity (sDSS)") +
+  stat_compare_means(
+    label = "p.signif",
+    comparisons = list(c("Resistant", "Sensitive")),
+    method = "wilcox.test"
+  ) +
+  scale_color_manual(values = c("Sensitive" = "#e9b383", "Resistant" = "#7c9d97")) +
+  theme(
+    strip.text.x = element_text(size = 13),
+    legend.position = "none"
+  )
+
+boxplot_fig
+
+ggsave(boxplot_fig, filename =  "../03.out/figure1/fpmtb_exVivo_arac_ida_boxplot.pdf", width = 5, height = 2)
+# -------------------------------
+## Exact the data for Defferential express analysis
+# -------------------------------
+
+# library(DESeq2)
+# library(readxl)
+# sample_cluster <- sample_cluster[order(sample_cluster$Label, decreasing = TRUE), ]
+# 
+# table(sample_cluster$Label)
+# 
+# count <- read.csv("../02.data/fpmtb_drug_gene_count.csv", header = T, row.names = 1)
+# tpm <- read.csv("../02.data/fpmtb_drug_gene_tpm.csv", header = T, row.names = 1)
+# colnames(tpm)[1] <- "ID"
+# 
+# tpm <- subset(tpm, Type %in% c("protein_coding", "miRNA", "lincRNA", "antisense",
+#                                "processed_transcript",
+#                                "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+#                                "transcribed_unprocessed_pseudogene","macro_lncRNA", "TEC",
+#                                "3prime_overlapping_ncRNA","sense_intronic", "sense_overlapping",
+#                                "unprocessed_pseudogene"))
+# tpm <- tpm[, c("ID", "Symbol", "Type", as.character(row.names(sample_cluster)))]
+# 
+# # filter low-express genes
+# tpm <- tpm[rowMeans(tpm[, 4:ncol(tpm)]) >= 0.05, ]
+# 
+# count <- count[tpm$ID, as.character(row.names(sample_cluster))]
+# 
+# ## run DESEQ2
+# source("../01.script/RunDESeq2.R")
+# 
+# RunDESeq2(count_mat = count, n.cont = 67, n.treat = 65,
+#           prefix = "../02.data/fpmtb_AraC_Ida_DESeq2_out_R_S", sort.p = FALSE,
+#           merge.normalized = TRUE,
+#           normalized_mat = tpm)
+
+```
+
+### Unsupervised clustering for "Ara-C + Daunorubicin" (4 clusters)
+
+```{r}
+# -------------------------------
+# Load required libraries
+# -------------------------------
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+library(ggbeeswarm)
+
+# -------------------------------
+# Load and subset drug sensitivity matrix
+# -------------------------------
+core_mat <- read.csv("../02.data/fpmtb_chemo_drug_sensitivity.csv", row.names = 1)
+selected_drugs <- c("Cytarabine", "Idarubicin")
+core_mat_sub <- core_mat[selected_drugs, ]
+core_mat_scaled <- scale(t(core_mat_sub)) %>% t()  # scale row-wise
+
+# -------------------------------
+# Clustering: 4 subclusters (2 sensitive, 2 resistant)
+# -------------------------------
+heat_result <- pheatmap(
+  core_mat_scaled,
+  color = colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "none",
+  cutree_cols = 4,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  border_color = "black",
+  clustering_method = "ward.D"
+)
+
+# Extract cluster assignments and compute mean sensitivity
+sample_cluster <- data.frame(
+  Sample = colnames(core_mat_scaled),
+  Cluster = cutree(heat_result$tree_col, k = 4)
+)
+sample_cluster$Mean_sDSS <- colMeans(core_mat_scaled)
+
+# Rank clusters by sensitivity (higher sDSS = more sensitive)
+cluster_labels <- sample_cluster %>%
+  group_by(Cluster) %>%
+  summarise(Avg_sDSS = mean(Mean_sDSS)) %>%
+  arrange(desc(Avg_sDSS)) %>%
+  mutate(Label = c("Sensitive-1", "Sensitive-2", "Resistant-1", "Resistant-2"))
+
+# Merge cluster label assignments
+sample_cluster <- sample_cluster %>%
+  left_join(cluster_labels, by = "Cluster") %>%
+  select(Sample, Cluster, Label) %>%
+  column_to_rownames("Sample")
+
+# -------------------------------
+# Prepare annotation for heatmap
+# -------------------------------
+annotation_col <- data.frame(
+  Label = factor(sample_cluster$Label,
+                 levels = c("Sensitive-1", "Sensitive-2", "Resistant-1", "Resistant-2"))
+)
+rownames(annotation_col) <- rownames(sample_cluster)
+
+ann_colors <- list(
+  Label = c(
+    "Sensitive-1" = "#e9b383", "Sensitive-2" = "#e9b383",
+    "Resistant-1" = "#7c9d97", "Resistant-2" = "#7c9d97"
+  )
+)
+
+# -------------------------------
+# Final annotated heatmap
+# -------------------------------
+ pdf("../03.out/figure1/02.exVivo_arac_ida_heatmap_fpmtb.pdf", width = 10, height = 2.5)
+pheatmap(
+  core_mat_scaled,
+  color = colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  cutree_cols = 4,
+  scale = "none",
+  border_color = "black",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  clustering_method = "ward.D"
+)
+ dev.off()
+
+# -------------------------------
+# Boxplot using scaled matrix
+# -------------------------------
+
+# Prepare data 
+
+drug_df <- core_mat_scaled %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(sample_cluster %>% rownames_to_column("Sample"), by = "Sample") %>%
+  pivot_longer(
+    cols = all_of(selected_drugs),
+    names_to = "Drug", values_to = "sDSS_scaled"
+  )
+
+drug_df$Drug <- factor(drug_df$Drug, levels = selected_drugs)
+drug_df$Label <- factor(drug_df$Label, levels = c("Resistant-1", "Resistant-2", "Sensitive-1", "Sensitive-2"))
+
+# -------------------------------
+# Plot: Compare Cytarabine vs Idarubicin within each cluster
+# -------------------------------
+drug_comparisons <- list(c("Cytarabine", "Idarubicin"))
+
+boxplot_fig <- ggplot(drug_df, aes(x = Drug, y = sDSS_scaled, fill = Drug)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = NA) +
+  geom_quasirandom(width = 0.2, alpha = 0.75, color = "black") +
+  facet_wrap(~Label, nrow = 1) +
+  theme_pubr() +
+  labs(x = NULL, y = "Scaled drug sensitivity (sDSS)") +
+  stat_compare_means(
+    label = "p.signif",
+    method = "wilcox.test",
+    comparisons = drug_comparisons
+  ) +
+  scale_fill_manual(values = c("Cytarabine" = "#e9b383", "Idarubicin" = "#7c9d97")) +
+  theme(
+    strip.text.x = element_text(size = 13),
+    legend.position = "none"
+  )
+
+boxplot_fig
+ggsave(boxplot_fig, filename = "../03.out/figure1/03.exVivo_arac_ida_boxplot_fpmtb.pdf", width = 8, height = 3)
+
+```
+
+### Unsupervised clustering for "Ara-C + Daunorubicin" (2 major groups)
+
+```{r}
+# -------------------------------
+# Load required libraries
+# -------------------------------
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+library(ggbeeswarm)
+
+# -------------------------------
+# Load and subset drug sensitivity matrix
+# -------------------------------
+core_mat <- read.csv("../02.data/fpmtb_chemo_drug_sensitivity.csv", row.names = 1)
+selected_drugs <- c("Cytarabine", "Daunorubicin")
+core_mat_sub <- core_mat[selected_drugs, ]
+
+# Convert to matrix and scale
+core_mat_scaled <- as.matrix(core_mat_sub)
+
+# Define color scale
+heat_colors <- colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100)
+
+# -------------------------------
+# First heatmap clustering to assign labels
+# -------------------------------
+heat_result <- pheatmap(
+  core_mat_scaled,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "row",
+  cutree_cols = 2,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  border_color = "black",
+  clustering_method = "ward.D"
+)
+
+# -------------------------------
+# Extract clustering and assign labels
+# -------------------------------
+# Assign cluster from pheatmap
+sample_cluster <- data.frame(
+  Sample = colnames(core_mat_scaled),
+  Cluster = cutree(heat_result$tree_col, k = 2)
+)
+
+# Calculate mean sDSS per sample (Cytarabine + Idarubicin)
+sample_cluster$Mean_sDSS <- colMeans(core_mat_scaled)
+
+# Determine which cluster is more sensitive (higher sDSS)
+cluster_avg <- sample_cluster %>%
+  group_by(Cluster) %>%
+  summarize(Avg_sDSS = mean(Mean_sDSS)) %>%
+  arrange(desc(Avg_sDSS)) %>%
+  mutate(Label = c("Sensitive", "Resistant"))
+
+# Merge back to assign labels
+sample_cluster <- sample_cluster %>%
+  left_join(cluster_avg, by = "Cluster") %>%
+  dplyr::select(Sample, Cluster, Label) %>%
+  column_to_rownames("Sample")
+
+# Prepare for heatmap annotation
+annotation_col <- data.frame(Label = factor(sample_cluster$Label))
+rownames(annotation_col) <- rownames(sample_cluster)
+
+ann_colors <- list(
+  Label = c("Sensitive" = "#e9b383", "Resistant" = "#7c9d97")
+)
+
+# -------------------------------
+# Final annotated heatmap
+# -------------------------------
+pdf("../03.out/figure1/fpmtb_exVivo_arac_dau_heatmap.pdf", width = 10, height = 4)
+pheatmap(
+  core_mat_scaled,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  cutree_cols = 2,
+  scale = "row",
+  border_color = "black",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  clustering_method = "ward.D"
+)
+dev.off()
+
+# -------------------------------
+# Boxplot of drug sensitivity by cluster
+# -------------------------------
+# Prepare long-format data
+drug_df <- as.data.frame(t(core_mat_sub)) %>%
+  rownames_to_column("Sample") %>%
+  left_join(sample_cluster %>% rownames_to_column("Sample"), by = "Sample") %>%
+  pivot_longer(
+    cols = all_of(selected_drugs),
+    names_to = "Drug",
+    values_to = "sDSS"
+  )
+
+# Reorder drug factor levels
+drug_df$Drug <- factor(drug_df$Drug, levels = selected_drugs)
+
+# Plot
+boxplot_fig <- ggplot(drug_df, aes(x = Label, y = sDSS, color = Label)) +
+  geom_boxplot_jitter(width = 0.5, alpha = 0.8, outlier.shape = NA) +
+  geom_quasirandom(width = 0.15, alpha = 0.75) +
+  facet_wrap(~Drug, ncol = 2) +
+  theme_pubr() +
+  labs(x = NULL, y = "Drug sensitivity (sDSS)") +
+  stat_compare_means(
+    label = "p.signif",
+    comparisons = list(c("Resistant", "Sensitive")),
+    method = "wilcox.test"
+  ) +
+  scale_color_manual(values = c("Sensitive" = "#e9b383", "Resistant" = "#7c9d97")) +
+  theme(
+    strip.text.x = element_text(size = 13),
+    legend.position = "none"
+  )
+
+boxplot_fig
+ggsave(boxplot_fig, filename =  "../03.out/figure1/fpmtb_exVivo_arac_dau_boxplot.pdf", width = 5, height = 2)
+# -------------------------------
+## Exact the data for Defferential express analysis
+# -------------------------------
+
+# library(DESeq2)
+# library(readxl)
+# sample_cluster <- sample_cluster[order(sample_cluster$Label, decreasing = TRUE), ]
+# 
+# table(sample_cluster$Label)
+# 
+# count <- read.csv("../02.data/fpmtb_drug_gene_count.csv", header = T, row.names = 1)
+# tpm <- read.csv("../02.data/fpmtb_drug_gene_tpm.csv", header = T, row.names = 1)
+# colnames(tpm)[1] <- "ID"
+# 
+# tpm <- subset(tpm, Type %in% c("protein_coding", "miRNA", "lincRNA", "antisense",
+#                                "processed_transcript",
+#                                "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+#                                "transcribed_unprocessed_pseudogene","macro_lncRNA", "TEC",
+#                                "3prime_overlapping_ncRNA","sense_intronic", "sense_overlapping",
+#                                "unprocessed_pseudogene"))
+# tpm <- tpm[, c("ID", "Symbol", "Type", as.character(row.names(sample_cluster)))]
+# 
+# # filter low-express genes
+# tpm <- tpm[rowMeans(tpm[, 4:ncol(tpm)]) >= 0.05, ]
+# 
+# count <- count[tpm$ID, as.character(row.names(sample_cluster))]
+# 
+# ## run DESEQ2
+# source("../01.script/RunDESeq2.R")
+# 
+# RunDESeq2(count_mat = count, n.cont = 51, n.treat = 81,
+#           prefix = "../02.data/fpmtb_AraC_Dau_DESeq2_out_R_S", sort.p = FALSE,
+#           merge.normalized = TRUE,
+#           normalized_mat = tpm)
+
+```
+
+### Unsupervised clustering for "Ara-C + Daunorubicin" (4 clusters)
+
+```{r}
+# -------------------------------
+# Load required libraries
+# -------------------------------
+library(pheatmap)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+library(ggbeeswarm)
+
+# -------------------------------
+# Load and subset drug sensitivity matrix
+# -------------------------------
+core_mat <- read.csv("../02.data/fpmtb_chemo_drug_sensitivity.csv", row.names = 1)
+selected_drugs <- c("Cytarabine", "Daunorubicin")
+core_mat_sub <- core_mat[selected_drugs, ]
+core_mat_scaled <- scale(t(core_mat_sub)) %>% t()  # scale row-wise
+
+# -------------------------------
+# Clustering: 4 subclusters (2 sensitive, 2 resistant)
+# -------------------------------
+heat_result <- pheatmap(
+  core_mat_scaled,
+  color = colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "none",
+  cutree_cols = 4,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  border_color = "black",
+  clustering_method = "ward.D"
+)
+
+# Extract cluster assignments and compute mean sensitivity
+sample_cluster <- data.frame(
+  Sample = colnames(core_mat_scaled),
+  Cluster = cutree(heat_result$tree_col, k = 4)
+)
+sample_cluster$Mean_sDSS <- colMeans(core_mat_scaled)
+
+# Rank clusters by sensitivity (higher sDSS = more sensitive)
+cluster_labels <- sample_cluster %>%
+  group_by(Cluster) %>%
+  summarise(Avg_sDSS = mean(Mean_sDSS)) %>%
+  arrange(desc(Avg_sDSS)) %>%
+  mutate(Label = c("Sensitive-1", "Sensitive-2", "Resistant-1", "Resistant-2"))
+
+# Merge cluster label assignments
+sample_cluster <- sample_cluster %>%
+  left_join(cluster_labels, by = "Cluster") %>%
+  dplyr::select(Sample, Cluster, Label) %>%
+  column_to_rownames("Sample")
+
+# -------------------------------
+# Prepare annotation for heatmap
+# -------------------------------
+annotation_col <- data.frame(
+  Label = factor(sample_cluster$Label,
+                 levels = c("Sensitive-1", "Sensitive-2", "Resistant-1", "Resistant-2"))
+)
+rownames(annotation_col) <- rownames(sample_cluster)
+
+ann_colors <- list(
+  Label = c(
+    "Sensitive-1" = "#e9b383", "Sensitive-2" = "#e9b383",
+    "Resistant-1" = "#7c9d97", "Resistant-2" = "#7c9d97"
+  )
+)
+
+# -------------------------------
+# Final annotated heatmap
+# -------------------------------
+pdf("../03.out/figure1/02.exVivo_arac_dau_heatmap_fpmtb.pdf", width = 10, height = 2.5)
+pheatmap(
+  core_mat_scaled,
+  color = colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  cutree_cols = 4,
+  scale = "none",
+  border_color = "black",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  angle_col = 90,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  clustering_method = "ward.D"
+)
+dev.off()
+
+# -------------------------------
+# Boxplot using scaled matrix
+# -------------------------------
+
+# Prepare data 
+
+drug_df <- core_mat_scaled %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(sample_cluster %>% rownames_to_column("Sample"), by = "Sample") %>%
+  pivot_longer(
+    cols = all_of(selected_drugs),
+    names_to = "Drug", values_to = "sDSS_scaled"
+  )
+
+drug_df$Drug <- factor(drug_df$Drug, levels = selected_drugs)
+drug_df$Label <- factor(drug_df$Label, levels = c("Sensitive-1", "Sensitive-2", "Resistant-1", "Resistant-2"))
+
+# -------------------------------
+# Plot: Compare Cytarabine vs Idarubicin within each cluster
+# -------------------------------
+drug_comparisons <- list(c("Cytarabine", "Daunorubicin"))
+
+boxplot_fig <- ggplot(drug_df, aes(x = Drug, y = sDSS_scaled, fill = Drug)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = NA) +
+  geom_quasirandom(width = 0.2, alpha = 0.75, color = "black") +
+  facet_wrap(~Label, nrow = 1) +
+  theme_pubr() +
+  labs(x = NULL, y = "Scaled drug sensitivity (sDSS)") +
+  stat_compare_means(
+    label = "p.signif",
+    method = "wilcox.test",
+    comparisons = drug_comparisons
+  ) +
+  scale_fill_manual(values = c("Cytarabine" = "#e9b383", "Daunorubicin" = "#7c9d97")) +
+  theme(
+    strip.text.x = element_text(size = 13),
+    legend.position = "none"
+  )
+
+boxplot_fig
+
+ggsave(boxplot_fig, filename = "../03.out/figure1/03.exVivo_arac_dau_boxplot_fpmtb.pdf", width = 8, height = 3)
+
+```
+
+## Pathway Enrichment via GSEA Using AraC-Correlated Gene List
+
+```{r gsea-analysis, eval=TRUE, message = FALSE, warning = FALSE}
+library(clusterProfiler)
+library(tidyverse)
+library(readr)
+
+# Load KEGG gene sets
+geneSet <- read.gmt("../02.data/c2.cp.kegg.v2023.1.Hs.symbols.gmt")
+
+# Define GSEA wrapper function with saving capability
+run_gsea <- function(file_path, symbol_col, score_col, tag, save_dir = "../02.data/GSEA_outputs") {
+  # Read file
+  df <- if (grepl("\\.csv$", file_path)) read_csv(file_path) else read.table(file_path, header = TRUE)
+  
+  # Prepare ranked gene list
+  gene_df <- df %>%
+    select(ID = all_of(symbol_col), Score = all_of(score_col)) %>%
+    distinct(ID, .keep_all = TRUE) %>%
+    drop_na() %>%
+    mutate(rank = rank(Score, ties.method = "random"))
+  
+  geneList <- gene_df$Score
+  names(geneList) <- gene_df$ID
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  # Run GSEA
+  set.seed(123456)
+  gsea_result <- GSEA(
+    geneList,
+    TERM2GENE = geneSet,
+    pvalueCutoff = 1,
+    nPermSimple = 100000,
+    maxGSSize = 800,
+    pAdjustMethod = "BH"
+  )
+  
+  # Save full gseaResult object to file for plotting later
+  if (!dir.exists(save_dir)) dir.create(save_dir)
+  saveRDS(gsea_result, file = file.path(save_dir, paste0("GSEA_result_", tag, ".rds")))
+  
+  # Return formatted results for merging
+  gsea_df <- gsea_result@result %>%
+    as_tibble() %>%
+    mutate(source = tag)
+  
+  return(gsea_df)
+}
+
+# Run and save for each dataset
+# gsea_ccle <- run_gsea("../02.data/CCLE_CorrOut.csv", "Symbol", "Z_score", "CCLE_inVitro")
+gsea_patient <- run_gsea("../02.data/BeatAML_AraC_AUC_Gene_Corr.csv", "Symbol", "Z_score", "Patient_exVivo")
+gsea_ida <- run_gsea("../02.data/fpmtb_AraC_Ida_DESeq2_out_R_S_with_normalized_mat.txt", "Symbol", "log2FoldChange", "AraC_Ida")
+gsea_dau <- run_gsea("../02.data/fpmtb_AraC_Dau_DESeq2_out_R_S_with_normalized_mat.txt", "Symbol", "log2FoldChange", "AraC_Dau")
+
+# Combine all results
+gsea_all <- bind_rows(gsea_patient, gsea_ida, gsea_dau) # gsea_ccle, 
+gsea_all$Description <- gsub("KEGG_", "", gsea_all$Description)
+# write_csv(gsea_all, "../02.data/gsea_all_sources.csv")
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(forcats)
+library(readr)
+
+# Load data
+gsea_all <- read_csv("../02.data/gsea_all_sources.csv")
+
+# Set factor levels for consistency
+gsea_all <- gsea_all %>%
+  mutate(
+    source = factor(source, levels = c("Patient_exVivo", "AraC_Ida", "AraC_Dau", "CCLE_inVitro")),
+    sig_label = ifelse(pvalue < 0.05, "*", "")
+  )
+
+# Define selected KEGG pathways
+selected_pathways <- c(
+  "JAK_STAT_SIGNALING_PATHWAY", "MAPK_SIGNALING_PATHWAY", "CHEMOKINE_SIGNALING_PATHWAY",
+  "CYTOKINE_CYTOKINE_RECEPTOR_INTERACTION", "TGF_BETA_SIGNALING_PATHWAY",
+  "FOCAL_ADHESION", "ADHERENS_JUNCTION", "REGULATION_OF_ACTIN_CYTOSKELETON",
+  "NOD_LIKE_RECEPTOR_SIGNALING_PATHWAY", "HEMATOPOIETIC_CELL_LINEAGE",
+  "TOLL_LIKE_RECEPTOR_SIGNALING_PATHWAY", "ANTIGEN_PROCESSING_AND_PRESENTATION",
+  "FC_GAMMA_R_MEDIATED_PHAGOCYTOSIS", "VEGF_SIGNALING_PATHWAY",
+  "ACUTE_MYELOID_LEUKEMIA", "APOPTOSIS", "RIBOSOME", "GLYCEROLIPID_METABOLISM",
+  "ASCORBATE_AND_ALDARATE_METABOLISM", "PYRIMIDINE_METABOLISM", "PURINE_METABOLISM",
+  "RNA_DEGRADATION", "DNA_REPLICATION", "PYRUVATE_METABOLISM",
+  "FATTY_ACID_METABOLISM", "OXIDATIVE_PHOSPHORYLATION"
+)
+
+# Subset and order pathways
+gsea_selected <- gsea_all %>%
+  filter(Description %in% selected_pathways) %>%
+  mutate(Description = factor(Description, levels = rev(selected_pathways)))
+
+# Plot
+p <- ggplot(gsea_selected, aes(x = Description, y = source)) +
+  geom_point(aes(color = NES, size = -log10(p.adjust)), alpha = 0.9) +
+  geom_text(
+    data = filter(gsea_selected, pvalue < 0.05),
+    aes(label = sig_label),
+    size = 4, fontface = "bold", color = "black"
+  ) +
+  scale_color_gradient2(
+    low = "#4575b4", mid = "white", high = "#d73027", midpoint = 0,
+    name = "NES"
+  ) +
+  scale_size_continuous(range = c(2, 6), name = expression(-log[10](FDR))) +
+  labs(x = "", y = "") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.key.height = unit(0.6, "cm")
+  )
+
+p
+
+ggsave(p, filename = "../03.out/figure1/06.gsea_dot.pdf", width = 10, height = 5.8)
+
+```
+
+## Resistant vs. Sensitive (Valcano plot)
+
+### Ara-C + Ida
+
+```{r}
+library(clusterProfiler)
+library(enrichplot)
+library(dplyr)
+
+degene_mat <- read.table("../02.data/fpmtb_AraC_Ida_DESeq2_out_R_S_with_normalized_mat.txt", header = TRUE)
+
+# Prepare ranked gene list for GSEA
+DE_list <- degene_mat %>%
+  dplyr::select(ID = 9, Corr = 3) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  drop_na() %>%
+  mutate(rank = rank(Corr, ties.method = "random"))
+
+geneList <- DE_list$Corr
+names(geneList) <- DE_list$ID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# Load AraC gene sets
+araC_gene_sets <- read_csv("../02.data/AraC_TopBottom1000_Genes.csv")
+AraC_GeneSets_df <- araC_gene_sets %>%
+  dplyr::select(term = category, gene = Symbol) %>%
+  distinct()  
+
+library(fgsea)
+
+# Convert TERM2GENE to a list
+gene_sets_list <- split(AraC_GeneSets_df$gene, AraC_GeneSets_df$term)
+
+# Run standard fgsea (instead of GSEA from clusterProfiler)
+fgsea.res <- fgsea(
+  pathways = gene_sets_list,
+  stats = geneList,
+  minSize = 1,
+  maxSize = 1200,
+  nperm = 100000
+)
+
+fgsea.res %>%
+  arrange(padj)
+
+fgsea.res$ES
+
+# Plot enrichment for AraC_Resistance
+pdf("../03.out/figure1/AraC_Resistance_gsea.pdf", width = 5, height = 2)
+plotEnrichment(gene_sets_list[["AraC_Resistance"]], geneList) +
+  ggtitle("Enrichment of AraC_Resistance Genes")
+dev.off()
+
+# Plot enrichment for AraC_Sensitivity
+pdf("../03.out/figure1/AraC_Sensitivity_gsea.pdf", width = 5, height = 2)
+plotEnrichment(gene_sets_list[["AraC_Sensitivity"]], geneList) +
+  ggtitle("Enrichment of AraC_Sensitivity Genes")
+dev.off()
+
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(ggrastr)
+
+# Load data
+diff <- read.table("../02.data/fpmtb_AraC_Ida_DESeq2_out_R_S_with_normalized_mat.txt", header = TRUE)
+
+# Cap log2FoldChange to [-4, 4] and padj to [1e-6, 1]
+diff <- diff %>%
+  mutate(
+    log2FoldChange = case_when(
+      log2FoldChange > 4 ~ 4,
+      log2FoldChange < -4 ~ -4,
+      TRUE ~ log2FoldChange
+    ),
+    padj = case_when(
+      padj < 1e-6 ~ 1e-6,
+      TRUE ~ padj
+    )
+  )
+
+# Classify genes based on log2FoldChange and adjusted p-value
+diff <- diff %>%
+  mutate(g = case_when(
+    log2FoldChange > 0.5 & padj < 0.05 ~ "up",
+    log2FoldChange < -0.5 & padj < 0.05 ~ "down",
+    TRUE ~ "stable"
+  ))
+
+# Extract significantly upregulated and downregulated genes
+diff_up <- diff %>% filter(g == "up")
+diff_down <- diff %>% filter(g == "down")
+
+# Load AraC gene sets
+araC_gene_sets <- read_csv("../02.data/AraC_TopBottom1000_Genes.csv")
+
+# Extract AraC_Resistance and AraC_Sensitivity gene symbols
+AraC_Resistance <- araC_gene_sets %>% filter(category == "AraC_Resistance") %>% pull(Symbol)
+AraC_Sensitivity <- araC_gene_sets %>% filter(category == "AraC_Sensitivity") %>% pull(Symbol)
+
+# Classify genes in the differential expression dataset
+
+diff <- diff %>%
+  mutate(gene_col = case_when(
+    Symbol %in% AraC_Resistance ~ "AraC_Resistance",
+    Symbol %in% AraC_Sensitivity ~ "AraC_Sensitivity",
+    TRUE ~ "all"
+  ))
+
+# Prepare data subsets
+data_bg <- diff %>% filter(gene_col == "all")
+data_geneset <- diff %>% filter(grepl("AraC_", gene_col))
+data_AraC_Resistance <- diff %>% filter(gene_col == "AraC_Resistance")
+data_AraC_Sensitivity <- diff %>% filter(gene_col == "AraC_Sensitivity")
+
+# Define the base plot
+p <- ggplot(diff, aes(x = log2FoldChange, y = -log10(padj))) +
+  # Add shaded regions for significant up- and down-regulated genes
+  annotate(
+    geom = "rect", fill = "#ea838e", alpha = 0.3,
+    xmin = min(diff_up$log2FoldChange), xmax = max(diff_up$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  annotate(
+    geom = "rect", fill = "#827fd6", alpha = 0.3,
+    xmin = min(diff_down$log2FoldChange), xmax = max(diff_down$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  # Plot background points
+  geom_point_rast(
+    data = data_bg, shape = 21, color = "black", alpha = 0.2,
+    size = 1.3, stroke = 0.6
+  ) +
+  # Plot gene set and key points
+  geom_point_rast(
+    data = data_geneset,
+    aes(fill = gene_col), shape = 21, color = "black",
+    size = 2, stroke = 0.8
+  ) +
+  # Custom fill colors for gene sets and key genes
+  scale_fill_manual(
+    values = c(
+      "AraC_Resistance" = "#faa400",
+      "AraC_Sensitivity" = "#bebebe"
+    )
+  ) +
+  # Add reference lines
+  geom_vline(xintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(yintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(
+    yintercept = -log10(0.05), color = "#ff7d82",
+    linewidth = 0.6, linetype = "dotted"
+  ) +
+  # Customize x-axis
+  scale_x_continuous(limits = c(-4, 4), breaks = seq(-4, 4, 1)) +
+  # Customize y-axis
+  scale_y_continuous(limits = c(-2, 7), breaks = seq(0, 6.5, 2), expand = c(0, 0)) +
+  # Apply classic theme and customize
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  ) +
+  # Customize axis labels
+  xlab("Resistant vs Sensitive (log2FC)") +
+  ylab("Significance (-log10 adj.p-val.)")
+
+# Add lineranges and annotations to the plot (p1)
+p1 <- p +
+  # Add lineranges for AraC_Resistance genes
+  geom_linerange(
+    data = data_AraC_Resistance,
+    aes(x = log2FoldChange, ymin = -1, ymax = -0.35),
+    color = "#faa400", size = 0.5, linewidth = 0.1
+  ) +
+  # Add lineranges for AraC_Sensitivity genes
+  geom_linerange(
+    data = data_AraC_Sensitivity,
+    aes(x = log2FoldChange, ymin = -1.75, ymax = -1.1),
+    color = "#bebebe", size = 0.5, linewidth = 0.1
+  ) +
+  # Add text annotations for AraC_Resistance and AraC_Sensitivity
+  annotate(
+    "text", x = -3, y = -0.7, label = "AraC_Resistance",
+    color = "#faa400", size = 4.8, hjust = 0
+  ) +
+  annotate(
+    "text", x = -3, y = -1.4, label = "AraC_Sensitivity",
+    color = "#bebebe", size = 4.8, hjust = 0
+  ) +
+  # Add enrichment statistics for AraC_Resistance
+  annotate(
+    "text", x = 3.0, y = -0.7, label = "ES: 0.38\npadj < 0.001",
+    color = "#faa400", size = 4.5, lineheight = 0.8, hjust = 1
+  ) +
+  # Add enrichment statistics for AraC_Sensitivity
+  annotate(
+    "text", x = 3.0, y = -1.4, label = "NES: -0.495\npadj < 0.001",
+    color = "#bebebe", size = 4.5, lineheight = 0.8, hjust = 1
+  )
+
+# Display the final plot
+p1
+ggsave(p1, filename = "../03.out/figure1/05.fpmtb_AraC_Ida_valcano.pdf", width = 6.5, height = 6)
+```
+
+### Ara-C + Dau
+
+```{r}
+library(clusterProfiler)
+library(enrichplot)
+library(fgsea)
+library(dplyr)
+library(tidyverse)
+
+degene_mat <- read.table("../02.data/fpmtb_AraC_Dau_DESeq2_out_R_S_with_normalized_mat.txt", header = TRUE)
+# Prepare ranked gene list for GSEA
+DE_list <- degene_mat %>%
+  select(ID = 9, Corr = 3) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  drop_na() %>%
+  mutate(rank = rank(Corr, ties.method = "random"))
+
+geneList <- DE_list$Corr
+names(geneList) <- DE_list$ID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# Load AraC gene sets
+araC_gene_sets <- read_csv("../02.data/AraC_TopBottom1000_Genes.csv")
+AraC_GeneSets_df <- araC_gene_sets %>%
+  select(term = category, gene = Symbol) %>%
+  distinct()  
+
+# Convert TERM2GENE to a list
+gene_sets_list <- split(AraC_GeneSets_df$gene, AraC_GeneSets_df$term)
+
+# Run standard fgsea (instead of GSEA from clusterProfiler)
+fgsea.res <- fgsea(
+  pathways = gene_sets_list,
+  stats = geneList,
+  minSize = 1,
+  maxSize = 1200,
+  nperm = 100000
+)
+
+fgsea.res %>%
+  arrange(padj)
+
+fgsea.res$ES
+
+# Plot enrichment for AraC_Resistance
+plotEnrichment(gene_sets_list[["AraC_Resistance"]], geneList) +
+  ggtitle("Enrichment of AraC_Resistance Genes")
+
+# Plot enrichment for AraC_Sensitivity
+plotEnrichment(gene_sets_list[["AraC_Sensitivity"]], geneList) +
+  ggtitle("Enrichment of AraC_Sensitivity Genes")
+
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(ggrastr)
+
+# Load data
+diff <- read.table("../02.data/fpmtb_AraC_Dau_DESeq2_out_R_S_with_normalized_mat.txt", header = TRUE)
+
+# Cap log2FoldChange to [-4, 4] and padj to [1e-6, 1]
+diff <- diff %>%
+  mutate(
+    log2FoldChange = case_when(
+      log2FoldChange > 4 ~ 4,
+      log2FoldChange < -4 ~ -4,
+      TRUE ~ log2FoldChange
+    ),
+    padj = case_when(
+      padj < 1e-6 ~ 1e-6,
+      TRUE ~ padj
+    )
+  )
+
+# Classify genes based on log2FoldChange and adjusted p-value
+diff <- diff %>%
+  mutate(g = case_when(
+    log2FoldChange > 0.5 & padj < 0.05 ~ "up",
+    log2FoldChange < -0.5 & padj < 0.05 ~ "down",
+    TRUE ~ "stable"
+  ))
+
+# Extract significantly upregulated and downregulated genes
+diff_up <- diff %>% filter(g == "up")
+diff_down <- diff %>% filter(g == "down")
+
+# Load AraC gene sets
+araC_gene_sets <- read_csv("../02.data/AraC_TopBottom1000_Genes.csv")
+
+# Extract AraC_Resistance and AraC_Sensitivity gene symbols
+AraC_Resistance <- araC_gene_sets %>% filter(category == "AraC_Resistance") %>% pull(Symbol)
+AraC_Sensitivity <- araC_gene_sets %>% filter(category == "AraC_Sensitivity") %>% pull(Symbol)
+
+# Classify genes in the differential expression dataset
+diff <- diff %>%
+  mutate(gene_col = case_when(
+    Symbol %in% AraC_Resistance ~ "AraC_Resistance",
+    Symbol %in% AraC_Sensitivity ~ "AraC_Sensitivity",
+    TRUE ~ "all"
+  ))
+
+# Prepare data subsets
+data_bg <- diff %>% filter(gene_col == "all")
+data_geneset <- diff %>% filter(grepl("AraC_", gene_col))
+data_AraC_Resistance <- diff %>% filter(gene_col == "AraC_Resistance")
+data_AraC_Sensitivity <- diff %>% filter(gene_col == "AraC_Sensitivity")
+
+# Define the base plot
+p <- ggplot(diff, aes(x = log2FoldChange, y = -log10(padj))) +
+  # Add shaded regions for significant up- and down-regulated genes
+  annotate(
+    geom = "rect", fill = "#ea838e", alpha = 0.3,
+    xmin = min(diff_up$log2FoldChange), xmax = max(diff_up$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  annotate(
+    geom = "rect", fill = "#827fd6", alpha = 0.3,
+    xmin = min(diff_down$log2FoldChange), xmax = max(diff_down$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  # Plot background points
+  geom_point_rast(
+    data = data_bg, shape = 21, color = "black", alpha = 0.2,
+    size = 1.3, stroke = 0.6
+  ) +
+  # Plot gene set and key points
+  geom_point_rast(
+    data = data_geneset,
+    aes(fill = gene_col), shape = 21, color = "black",
+    size = 2, stroke = 0.8
+  ) +
+  # Custom fill colors for gene sets and key genes
+  scale_fill_manual(
+    values = c(
+      "AraC_Resistance" = "#faa400",
+      "AraC_Sensitivity" = "#bebebe"
+    )
+  ) +
+  # Add reference lines
+  geom_vline(xintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(yintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(
+    yintercept = -log10(0.05), color = "#ff7d82",
+    linewidth = 0.6, linetype = "dotted"
+  ) +
+  # Customize x-axis
+  scale_x_continuous(limits = c(-4, 4), breaks = seq(-4, 4, 1)) +
+  # Customize y-axis
+  scale_y_continuous(limits = c(-2, 7), breaks = seq(0, 6.5, 2), expand = c(0, 0)) +
+  # Apply classic theme and customize
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  ) +
+  # Customize axis labels
+  xlab("Resistant vs Sensitive (log2FC)") +
+  ylab("Significance (-log10 adj.p-val.)")
+
+# Add lineranges and annotations to the plot (p1)
+p1 <- p +
+  # Add lineranges for AraC_Resistance genes
+  geom_linerange(
+    data = data_AraC_Resistance,
+    aes(x = log2FoldChange, ymin = -1, ymax = -0.35),
+    color = "#faa400", size = 0.5, linewidth = 0.1
+  ) +
+  # Add lineranges for AraC_Sensitivity genes
+  geom_linerange(
+    data = data_AraC_Sensitivity,
+    aes(x = log2FoldChange, ymin = -1.75, ymax = -1.1),
+    color = "#bebebe", size = 0.5, linewidth = 0.1
+  ) +
+  # Add text annotations for AraC_Resistance and AraC_Sensitivity
+  annotate(
+    "text", x = -3, y = -0.7, label = "AraC_Resistance",
+    color = "#faa400", size = 4.8, hjust = 0
+  ) +
+  annotate(
+    "text", x = -3, y = -1.4, label = "AraC_Sensitivity",
+    color = "#bebebe", size = 4.8, hjust = 0
+  ) +
+  # Add enrichment statistics for AraC_Resistance
+  annotate(
+    "text", x = 3.0, y = -0.7, label = "ES: 0.43\npadj = 0.02",
+    color = "#faa400", size = 4.5, lineheight = 0.8, hjust = 1
+  ) +
+  # Add enrichment statistics for AraC_Sensitivity
+  annotate(
+    "text", x = 3.0, y = -1.4, label = "ES: -0.51\npadj < 0.001",
+    color = "#bebebe", size = 4.5, lineheight = 0.8, hjust = 1
+  )
+
+# Display the final plot
+p1
+ggsave(p1, filename = "../03.out/figure1/05.fpmtb_AraC_dau_valcano.pdf", width = 6.5, height = 6)
+```
+
+## Pathway Enrichment via GSEA Using Fold change of Genes between Resistant and Sensitive (Ara-C + Ida)
+
+```{r gsea-7+3, eval=TRUE, message = FALSE, warning = FALSE}
+library(clusterProfiler)
+library(enrichplot)
+library(GseaVis)
+library(reactable)
+library(tidyverse)
+
+# Define a GSEA plotting function
+theme_set(theme_classic())
+plot_gseaNb <- function(gsea_obj, gene_set, curve_colors = c('#7582c1', '#f99f1c'), 
+                        ht_colors = curve_colors, rank_colors = c('#7582c1', 'white', '#f99f1c')) {
+  gseaNb(
+    object = gsea_obj,
+    geneSetID = gene_set,
+    addPval = TRUE,
+    subPlot = 3,
+    curveCol = curve_colors,
+    htCol = ht_colors,
+    rankCol = rank_colors
+  )
+}
+
+# Load correlation results
+degene_mat <- read.table("../02.data/fpmtb_AraC_Dau_DESeq2_out_R_S_with_normalized_mat.txt", header = TRUE)
+
+# Prepare ranked gene list for GSEA
+DE_list <- degene_mat %>%
+  select(ID = 9, Corr = 3) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  drop_na() %>%
+  mutate(rank = rank(Corr, ties.method = "random"))
+
+geneList <- DE_list$Corr
+names(geneList) <- DE_list$ID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# Load KEGG gene sets
+geneSet <- read.gmt("../02.data/c2.cp.kegg.v2023.1.Hs.symbols.gmt")
+
+# Perform GSEA
+set.seed(123456)
+gsea.enrich <- GSEA(
+  geneList,
+  TERM2GENE = geneSet,
+  pvalueCutoff = 1,
+  nPermSimple = 100000,
+  maxGSSize = 800,
+  pAdjustMethod = "BH",
+  seed = TRUE
+)
+gsea.out <- gsea.enrich@result
+gsea.out <- gsea.out[, -11]
+
+# Display GSEA table
+reactable(
+  gsea.out[, 1:10],
+  pagination = TRUE,
+  highlight = TRUE,
+  searchable = TRUE,
+  defaultPageSize = 10
+)
+
+# Dot plot of significant GSEA results
+sig.gsea <- gsea.out %>%
+  filter(p.adjust < 0.05) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(gsub("KEGG_", "", Description), levels = gsub("KEGG_", "", Description)))
+
+p <- ggplot(sig.gsea, aes(x = NA, y = Description, color = NES, size = -log10(p.adjust))) +
+  geom_point(stroke = 1) +
+  labs(x = "", y = "") +
+  scale_color_gradient2(low = "#7582c1", mid = "white", high = "#f99f1c") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45))
+
+p
+
+# Visualize selected KEGG pathways
+
+plot_gseaNb(gsea.enrich, gene_set = "KEGG_JAK_STAT_SIGNALING_PATHWAY")
+plot_gseaNb(gsea.enrich, gene_set = "KEGG_MAPK_SIGNALING_PATHWAY")
+plot_gseaNb(gsea.enrich, gene_set = "KEGG_PYRIMIDINE_METABOLISM")
+plot_gseaNb(gsea.enrich, gene_set = "KEGG_RIBOSOME")
+
+```
+
+## DFS-Linked Gene Signatures in TCGA-LAML Cohort
+
+To explore whether AraC-associated transcriptional profiles correlate with clinical outcomes, we analyzed RNA-seq and survival data from 141 AML patients treated with Ara-C in the TCGA-LAML cohort. Specifically, we identified genes associated with disease-free survival (DFS) using multivariate Cox proportional hazards regression, and used GSEA to determine pathway-level enrichment of these prognostic signals.
+
+```{r tcga-cox-analysis, eval=FALSE, message = FALSE, warning = FALSE}
+# ==============================
+# Step 0: Load Required Libraries
+# ==============================
+# library(survival)
+# library(readr)
+# library(dplyr)
+# library(tibble)
+# 
+# # ==============================
+# # Step 1: Load Expression and Clinical Data
+# # ==============================
+# # Read expression matrix: must include 'Symbol' column for gene symbols
+# tcga_expr <- read.table("../02.data/tcga_all_179_TPM_matrix.txt", 
+#                         header = TRUE, sep = "\t")
+# 
+# # Confirm Symbol column exists
+# if (!"Symbol" %in% colnames(tcga_expr)) {
+#   stop("No 'Symbol' column found in expression matrix.")
+# }
+# 
+# # Clean up Symbol column
+# tcga_expr$Symbol <- trimws(as.character(tcga_expr$Symbol))
+# 
+# # Load clinical info
+# clin_info <- read.csv("../02.data/TCGA_DFS_AraC_clinical.csv", header = TRUE)
+# clin_info$sample <- as.character(clin_info$sample)
+# 
+# # Identify common samples between expression and clinical data
+# common_samples <- intersect(colnames(tcga_expr), clin_info$sample)
+# common_samples <- sort(common_samples)
+# 
+# # Subset expression and clinical to common samples
+# expr_sub <- tcga_expr[, c("Symbol", common_samples)]
+# clin_info <- clin_info[match(common_samples, clin_info$sample), ]
+# rownames(clin_info) <- clin_info$sample
+# 
+# # ==============================
+# # Step 2: Filter Genes 
+# # ==============================
+# 
+# # Filter and aggregate expression data by gene Symbol
+# expr_filtered <- expr_sub %>%
+#   group_by(Symbol) %>%
+#   summarise(across(where(is.numeric), mean), .groups = "drop") %>%
+#   filter(rowMeans(across(where(is.numeric))) > 0.25) %>%  
+#   column_to_rownames("Symbol")
+# 
+# # Ensure order matches
+# expr_filtered <- expr_filtered[, common_samples]
+# 
+# # Transpose to sample x gene
+# expr_transposed <- as.data.frame(t(expr_filtered))
+# 
+# # ==============================
+# # Step 3: Combine with Clinical Data
+# # ==============================
+# cox_data <- bind_cols(
+#   clin_info %>% select(DFS_time, DFS_status, Age, Sex, WBC, cytogenetic_risk),
+#   expr_transposed
+# )
+# 
+# # ==============================
+# # Step 4: Cox Regression with Progress Bar
+# # ==============================
+# gene_names <- colnames(expr_transposed)
+# cox_results <- data.frame(
+#   Gene = gene_names,
+#   Coefficient = NA_real_,
+#   HR = NA_real_,
+#   P.value = NA_real_,
+#   stringsAsFactors = FALSE
+# )
+# 
+# pb <- txtProgressBar(min = 0, max = length(gene_names), style = 3)
+# 
+# for (i in seq_along(gene_names)) {
+#   gene <- gene_names[i]
+#   formula <- as.formula(paste0("Surv(DFS_time, DFS_status) ~ Age + Sex + WBC + cytogenetic_risk + `", gene, "`"))
+#   
+#   fit <- tryCatch({
+#     summary(coxph(formula, data = cox_data))
+#   }, error = function(e) NULL)
+# 
+#   if (!is.null(fit)) {
+#     gene_row <- grep(paste0("^", gene, "$"), rownames(fit$coefficients))
+#     if (length(gene_row) == 1) {
+#       cox_results[i, "Coefficient"] <- fit$coefficients[gene_row, 1]
+#       cox_results[i, "HR"] <- exp(fit$coefficients[gene_row, 1])
+#       cox_results[i, "P.value"] <- fit$coefficients[gene_row, 5]
+#     }
+#   }
+# 
+#   setTxtProgressBar(pb, i)
+# }
+# close(pb)
+# 
+# # Save to file
+# write.csv(cox_results, "../02.data/TCGA_AraC_GeneWise_Cox_Results.csv", row.names = FALSE)
+
+```
+
+```{r tcga-dfs-gsea-analysis, eval=TRUE, message = FALSE, warning = FALSE}
+# ==============================
+# Load Libraries
+# ==============================
+library(tidyverse)
+library(clusterProfiler)
+library(GseaVis)
+library(cowplot)
+
+# ==============================
+# Step 1: Load and Prepare Ranked Gene List (Cox Coefficients)
+# ==============================
+cox_results <- read.csv("../02.data/TCGA_AraC_GeneWise_Cox_Results.csv")
+
+# Keep only necessary columns and handle duplicates or NAs
+ranked_genes <- cox_results %>%
+  select(Gene, Coefficient) %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  drop_na() %>%
+  arrange(desc(Coefficient))  # Sort by effect size
+
+# Create named numeric vector for GSEA
+geneList <- setNames(ranked_genes$Coefficient, ranked_genes$Gene)
+geneList <- sort(geneList, decreasing = TRUE)
+
+# ==============================
+# Step 2: Load KEGG Gene Sets
+# ==============================
+# Option A: Local KEGG GMT file
+kegg_sets <- read.gmt("../02.data/c2.cp.kegg.v2023.1.Hs.symbols.gmt")
+
+# ==============================
+# Step 3: Run GSEA
+# ==============================
+set.seed(123456)
+gsea_result <- GSEA(
+  geneList,
+  TERM2GENE = kegg_sets,
+  pvalueCutoff = 1,
+  pAdjustMethod = "BH",
+  nPermSimple = 1000,
+  maxGSSize = 800,
+  minGSSize = 10,
+  seed = TRUE
+)
+
+# Save results
+gsea_df <- gsea_result@result
+write.csv(gsea_df, "../02.data/TCGA_Cox_GSEA_KEGG.csv", row.names = FALSE)
+
+# ==============================
+# Step 4: Plot Selected Enriched Pathways
+# ==============================
+# List of key gene sets to visualize
+pathways_to_plot <- c(
+  "KEGG_JAK_STAT_SIGNALING_PATHWAY",
+  "KEGG_CHEMOKINE_SIGNALING_PATHWAY",
+  "KEGG_RIBOSOME",
+  "KEGG_FATTY_ACID_METABOLISM"
+)
+
+gsea_plots <- lapply(pathways_to_plot, function(pathway_id) {
+  gseaNb(
+    object = gsea_result, 
+    geneSetID = pathway_id,
+    newGsea = F, addPval = TRUE,
+    pvalX = 0.55, pvalY = 0.75,
+    pCol = "black", pHjust = 0, subPlot = 2,
+    curveCol = c('#7582c1', '#f99f1c'),
+    htCol = c("#7582c1", "#f99f1c"),
+    rankCol = c("#7582c1", "white", "#f99f1c")
+  )
+})
+
+combined_plot <- cowplot::plot_grid(
+  plotlist = gsea_plots, ncol = 4,
+  align = "hv"
+)
+combined_plot
+
+ggsave(
+  filename = "../03.out/figure1/TCGA_GSEA_Selected_KEGG.pdf",
+  plot = combined_plot, width = 13, height = 3
+)
+
+```
+

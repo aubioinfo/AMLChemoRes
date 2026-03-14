@@ -1,0 +1,724 @@
+# Figure 5: ARG24 score is associated with cellular hierarchy and predicts AML relapse 
+
+Zeng et. al. (Nat Med, 2022) recently described a cellular hierarchy of AML leukemic cells representing distinct maturation states including LSPC-Quiescent, LSPC-Primed, LSPC-Cycle, GMP-like, ProMono-like, Mono-like and cDC-like. We investigated ARG24 score across these AML hierarchies and found that it was highest among cells in the HSPC-like state. Zeng et al. also revealed 4 distinct subtypes in bulk cohort based on the composition of their leukemia cell hierarchy. We projected the ARG24 scores on this map and validated the ARG24 scores in these 4 distinct subtypes, and it was highest in the Primitive state while lowest in GMP states.  
+
+## ARG24 Scores Across AML Cellular Hierarchies (Single-cell)
+
+```{r fig5_scaml_arg24_umap, eval=TRUE, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(Seurat)
+library(tidyr)
+library(corrplot)
+library(RColorBrewer)
+
+# Load Seurat object
+scaml <- readRDS("../02.data/scaml_Diag.rds")
+
+# Replace UMAP coordinates with Zeng UMAPs
+umap1 <- scaml@meta.data$Zeng_UMAP1
+umap2 <- scaml@meta.data$Zeng_UMAP2
+names(umap1) <- names(umap2) <- rownames(scaml@meta.data)
+scaml@reductions[["umap"]]@cell.embeddings[, 1] <- umap1
+scaml@reductions[["umap"]]@cell.embeddings[, 2] <- umap2
+
+# Set identities and colors
+Idents(scaml) <- 'Zeng_CellType'
+my36colors <- c(
+  '#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+  '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658', 
+  '#9FA3A8', '#E0D4CA', '#5F3D69', '#58A4C3', "#b20000",'#E4C755', '#F7F398',
+  '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+  '#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963',
+  '#968175')
+
+# UMAP plot by Zeng cell type
+# pdf("../03.out/figure5/01.scaml_umap.pdf", width = 5.8, height = 4)
+DimPlot(scaml, group.by = "Zeng_CellType", label = TRUE, repel = TRUE, raster = FALSE, cols = my36colors)
+# dev.off()
+```
+
+```{r fig5_scaml_arg24_score, eval=TRUE, message=FALSE, warning=FALSE}
+# Define ARG24 risk score calculation function
+
+risk_score <- function(dat, candidate_genes, lasso_report) {
+  genes <- intersect(colnames(dat), candidate_genes)
+  risk_score_table <- dat[, genes]
+  for (g in genes) {
+    risk_score_table[, g] <- as.matrix(risk_score_table[, g]) * lasso_report[g, 1]
+  }
+  risk_scores <- rowSums(risk_score_table)
+  data.frame(ARG24 = risk_scores)
+}
+
+# Calculate ARG24 score from expression
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1)
+intersected_genes <- intersect(rownames(scaml), rownames(gene.min))
+sc_expr <- as.data.frame(scaml@assays$RNA@data[intersected_genes, ])
+sc_expr_t <- data.frame(t(sc_expr))
+arg24_scores <- risk_score(sc_expr_t, intersected_genes, gene.min)
+scaml <- AddMetaData(scaml, metadata = arg24_scores)
+
+```
+
+```{r fig5_scaml_arg24_vln_corrplot, eval=TRUE, message=FALSE, warning=FALSE}
+# Violin plot of ARG24 scores across cell types
+VlnPlot(scaml, features = "ARG24")
+
+# Mean ARG24 scores by cell type
+mean_arg24 <- aggregate(scaml@meta.data$ARG24, by = list(scaml@meta.data$Zeng_CellType), FUN = mean)
+scaled_arg24 <- data.frame(ARG24 = scale(mean_arg24$x))
+rownames(scaled_arg24) <- mean_arg24$Group.1
+
+# Correlation circle plot
+rdbu_palette <- rev(colorRampPalette(brewer.pal(11, 'RdBu'))(100))
+# pdf("../03.out/figure5/02.scaml_corplot.pdf", width = 5.8, height = 6)
+corrplot(data.matrix(scaled_arg24), method = "circle", tl.cex = 1, is.corr = FALSE, tl.col = 'black', cl.ratio = 0.75, col = rdbu_palette)
+# dev.off()
+```
+
+## ARG24 Scores and AML Hierarchy in Bulk Cohorts
+
+```{r fig5_bulk_pca_violin, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+library(ggplot2)
+library(ggbeeswarm)
+library(RColorBrewer)
+
+# Load bulk data with ARG24 and hierarchy info
+dat <- read.csv("../02.data/2022NM_cellAbundances.csv", header = TRUE)
+dat$Cluster <- factor(dat$Cluster, levels = c("Primitive", "GMP", "Intermediate", "Mature"))
+dat$RiskScore[which(dat$RiskScore >= 5)] <- 5
+
+# PCA plot by Cluster
+p0 <- ggplot(dat, aes(x = PC1, y = PC2, fill = Cluster)) +
+  geom_point(size = 2, shape = 21, alpha = 0.7) +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position = "top", axis.line = element_line(size = 0.75, colour = "black"))
+
+# PCA plot by RiskScore
+p1 <- ggplot(dat, aes(x = PC1, y = PC2, fill = RiskScore)) +
+  geom_point(size = 2, shape = 21, alpha = 0.7) +
+  theme_classic() +
+  scale_fill_gradient2(low = "#74ADD1", mid = "white", high = "#F46D43") +
+  theme(legend.position = "top", axis.line = element_line(size = 0.75, colour = "black"))
+
+# Violin plot by subtype
+p2 <- ggplot(dat, aes(x = Cluster, y = RiskScore, color = Cluster)) +
+  geom_violin() +
+  geom_boxplot(width = 0.4, alpha = 0.85) +
+  geom_quasirandom(width = 0.25, alpha = 0.25) +
+  theme_pubr() +
+  xlab("") + ylab("Risk score") +
+  theme(strip.text.x = element_text(size = 13), legend.position = 'None') +
+  stat_compare_means(comparisons = list(
+    c('Primitive', 'GMP'),
+    c('Primitive', 'Intermediate'),
+    c('Primitive', 'Mature'),
+    c('GMP', 'Intermediate'),
+    c('GMP', 'Mature'),
+    c('Intermediate', 'Mature')
+  ), method = 'wilcox.test') +
+  scale_color_brewer(palette = "Set2")
+
+# Combine plots
+p_combined <- ggarrange(p0, p1, p2, ncol = 3, nrow = 1)
+
+# pdf("../03.out/figure5/03.bulk_pca.pdf", width = 10, height = 4)
+p_combined
+# dev.off()
+```
+
+## ARG24 Score Dynamics from Diagnosis to Relapse
+
+```{r , eval=TRUE, message=FALSE, warning=FALSE}
+# Diagnosis-relapse paired analysis
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(ggrastr)
+library(RColorBrewer)
+
+meta_info <- read_xlsx("../02.data/bulk_diag_r-r_clinical.xlsx")
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE)
+colnames(gene.min)[1] <- "Symbol"
+
+# Define risk score function
+risk_score <- function(dat, candidate_genes, lasso_report) {
+  genes <- intersect(colnames(dat), candidate_genes)
+  risk_score_table <- dat[, genes]
+  for (g in genes) {
+    risk_score_table[, g] <- as.matrix(risk_score_table[, g]) * lasso_report[g, 1]
+  }
+  data.frame(risk_score = rowSums(risk_score_table))
+}
+
+# Preprocess gene expression matrix
+mat_132 <- read.csv("../02.data/bulk_diag_relapse_batchRemoved_tpm_132.csv", header = TRUE, row.names = 1)
+mat_132 <- merge(gene.min, mat_132, by = "Symbol")
+rownames(mat_132) <- mat_132$Symbol
+mat_132 <- mat_132[, -c(1:3)]
+mat_132 <- data.frame(t(mat_132))
+colnames(mat_132)[9] <- "INHBA-AS1"
+colnames(mat_132)[16:17] <- c("RP11-158I9.8", "RP5-1119A7.14")
+colnames(mat_132)[24] <- "UNC5B-AS1"
+
+# Compute risk scores
+genes <- colnames(mat_132)
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1)
+mat_132_RiskScores <- risk_score(mat_132, genes, gene.min)
+mat_132_RiskScores$Sample <- rownames(mat_132_RiskScores)
+mat_132_RiskScores <- merge(mat_132_RiskScores, meta_info, by = "Sample")
+# Save the risk scores (optional)
+# write.csv(mat_132_RiskScores, "../02.data/mat_132_RiskScores.csv")
+```
+
+```{r fig5_dx_relapse_validation, eval=TRUE, message=FALSE, warning=FALSE}
+mat_132_RiskScores <- read.csv("../02.data/mat_132_RiskScores.csv")
+
+# Violin plot comparing timepoints
+p1 <- ggplot(mat_132_RiskScores, aes(x = timepoint, y = risk_score)) +
+  geom_violin(aes(fill = timepoint), alpha = 0.35) +
+  geom_boxplot(aes(fill = timepoint), width = 0.3, alpha = 0.5) +
+  geom_point(aes(color = timepoint), size = 2, shape = 19, alpha = 0.95) +
+  geom_line(aes(group = Patient), color = 'gray', lwd = 0.5) +
+  scale_fill_manual(values = c("#5AAE61", "#9970AB")) +
+  scale_color_brewer(palette = "Accent") +
+  theme_pubr() +
+  labs(x = '', y = 'ARG24 score') +
+  stat_compare_means(comparisons = list(c('Diagnosis', 'Relapse')), paired = TRUE)
+
+# Compare change direction
+data <- mat_132_RiskScores[, c("Patient", "timepoint", "risk_score")]
+dat <- dcast(Patient ~ timepoint, data = data)
+dat$Relap_Diag <- dat$Relapse - dat$Diagnosis
+dat$type <- ifelse(dat$Relap_Diag > 0, "Increased", "Decreased")
+
+# Diagnosis score by relapse change type
+p2 <- ggplot(dat, aes(x = type, y = Diagnosis, color = type)) +
+  geom_violin() +
+  geom_boxplot_jitter(width = 0.4, alpha = 0.75) +
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  theme_pubr() +
+  labs(x = '', y = 'Risk score') +
+  stat_compare_means(comparisons = list(c('Increased', 'Decreased')), method = 'wilcox.test') +
+  scale_color_manual(values = c("#5AAE61", "#9970AB"))
+
+# Combine and save
+plots <- p1 + p2
+plots
+# ggsave(plots, filename = "../03.out/figure5/04.Dx_Rel_violin.pdf", width = 6, height = 3.5)
+```
+
+## ARG24 Score Predicts AML Relapse and CIR
+
+```{r fig5_km_efs_cir, eval=TRUE, message=FALSE, warning=FALSE}
+# EFS analysis
+library(readxl)
+library(survival)
+library(survminer)
+
+mat <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+mat$group <- ifelse(mat$risk_score >= median(mat$risk_score), "High ARG24", "Low ARG24")
+surv_obj <- Surv(mat$EFS_Time, mat$EFS_Status)
+surv_fit <- survfit(surv_obj ~ mat$group)
+surv_diff <- survdiff(surv_obj ~ mat$group)
+p_val <- 1 - pchisq(surv_diff$chisq, length(surv_diff$n) - 1)
+hr <- (surv_diff$obs[1] / surv_diff$exp[1]) / (surv_diff$obs[2] / surv_diff$exp[2])
+hr_ci_low <- exp(log(hr) - qnorm(0.975) * sqrt(1 / surv_diff$exp[2] + 1 / surv_diff$exp[1]))
+hr_ci_high <- exp(log(hr) + qnorm(0.975) * sqrt(1 / surv_diff$exp[2] + 1 / surv_diff$exp[1]))
+
+p_label <- ifelse(p_val < 0.001, "p < 0.001", paste("p =", round(p_val, 3)))
+plot1 <- ggsurvplot(
+  surv_fit, data = mat, palette = "nejm",
+  pval = paste(p_label, paste("HR =", round(hr, 2)), paste("95% CI:", round(hr_ci_low, 2), "-", round(hr_ci_high, 2)), sep = "\n"),
+  pval.size = 5, xlab = "Survival time in days",
+  conf.int = FALSE, risk.table = FALSE,
+  legend.title = "RJAML cohort",
+  legend.labs = c(
+    paste0("High ARG24 (N = ", sum(mat$group == "High ARG24"), ")"),
+    paste0("Low ARG24 (N = ", sum(mat$group == "Low ARG24"), ")")
+  ), legend = c(0.65, 0.85)
+)
+
+# pdf("../03.out/figure5/04.efs.km.pdf", width = 4.2, height = 4)
+plot1
+# dev.off()
+```
+
+```{r fig5_km_cir, eval=TRUE, message=FALSE, warning=FALSE}
+library(cmprsk)
+df <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+df$group <- ifelse(df$risk_score >= median(df$risk_score), "High ARG24", "Low ARG24")
+df <- df[!is.na(df$CIR_time) & !is.na(df$CIR_status), ]
+ci <- cuminc(ftime = df$CIR_time, fstatus = df$CIR_status, group = as.factor(df$group))
+# pdf("../03.out/figure5/05.cir.km.pdf", width = 4, height = 4.4)
+plot(ci, xlab = "Time (days)", ylab = "Cumulative incidence of relapse", col = 1:length(ci), lty = 1:length(ci))
+# dev.off()
+```
+
+## Validation in Independent Cohort (phs001027)
+
+```{r fig5_rfs_phs001027, eval=TRUE, message=FALSE, warning=FALSE}
+# Relapse-free survival in phs001027
+library(readxl)
+dat <- read_xlsx("../02.data/phs001027_clinical.xlsx")
+dat$group <- ifelse(dat$risk_score >= median(dat$risk_score), "High", "Low")
+plot1 <- ggsurvplot(
+  survfit(Surv(Time_to_Relapse, Relapse) ~ group, data = dat),
+  palette = "nejm", pval.size = 5, pval = TRUE,
+  xlab = "Survival time in days", conf.int = FALSE,
+  risk.table = FALSE, surv.median.line = 'hv',
+  legend.title = "",
+  legend.labs = c(
+    paste0("High ARG24 (N = ", sum(dat$group == "High"), ")"),
+    paste0("Low ARG24 (N = ", sum(dat$group == "Low"), ")")
+  ), legend = c(0.65, 0.85)
+)
+
+# pdf("../03.out/figure5/07.phs001027_rfs.pdf", width = 4.2, height = 4)
+plot1
+# dev.off()
+```
+
+## ARG24 Score Distinguishes Relapse in Treatment-naive AML
+
+```{r fig5_violin_relapse_vs_nonrelapse, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+library(ggrastr)
+library(patchwork)
+library(RColorBrewer)
+library(readxl)
+
+# RJAML cohort
+mat <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+mat$Relapse <- ifelse(mat$Relapse == "1", "Relapse", "Non-relapse")
+
+# Plot for RJAML cohort
+p1 <- ggplot(mat, aes(x = Relapse, y = risk_score, color = Relapse)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.4, alpha = 0.75) + 
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  theme_pubr() + 
+  xlab("") + 
+  ylab("ARG24 score") +
+  theme(strip.text.x = element_text(size = 13)) +
+  stat_compare_means(comparisons = list(c('Relapse', 'Non-relapse')), method = 'wilcox.test') + 
+  scale_color_manual(values = c("#5AAE61", "#9970AB")) + 
+  theme(legend.position = 'None')
+
+# GSE165430 cohort (CN-AML)
+dat <- read.csv("../02.data/GSE165430_268_riskScore.csv", header = TRUE)
+dat$type <- ifelse(dat$type == "relapse", "Relapse", "Non-relapse")
+
+# Plot for GSE165430 cohort
+p2 <- ggplot(dat, aes(x = type, y = risk_score, color = type)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.4, alpha = 0.75) + 
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  theme_pubr() + 
+  xlab("") + 
+  ylab("ARG24 score") +
+  theme(strip.text.x = element_text(size = 13)) +
+  stat_compare_means(comparisons = list(c('Relapse', 'Non-relapse')), method = 'wilcox.test') +   
+  scale_color_manual(values = c("#5AAE61", "#9970AB")) + 
+  theme(legend.position = 'None')
+
+# Combine and save
+combined_plot <- p1 + p2
+combined_plot
+ggsave(combined_plot, filename = "../03.out/figure5/06.Dx_R_NR_violin.pdf", width = 5, height = 3.5)
+```
+
+## Multivariable Cox Model for Predicting EFS
+
+```{r fig5_multivariable_cox_efs, eval=TRUE, message=FALSE, warning=FALSE}
+library(forestmodel)
+library(readxl)
+library(survival)
+
+# Load and preprocess data
+dat <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+dat$`ARG24 score` <- dat$risk_score
+dat$`D5-PBCR` <- ifelse(dat$`D5-PBCR` == 'Pos', 1, 0)
+dat$`ELN2022 (Adv. vs. Fav._Int.)` <- ifelse(dat$ELN2022 == 'Adverse', 1, 0)
+
+# Define forest plot layout
+forest.panels <- list(
+  list(width = 0.01),
+  list(width = 0.1, display = ~variable, fontface = "bold", heading = "Variable"),
+  list(width = 0.1, display = ~level),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.55, item = "forest", hjust = 0.5, heading = "Hazard ratio", linetype = "dashed", line_x = 0),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.12, display = ~ ifelse(reference, "Reference", sprintf("%0.3f (%0.3f, %0.3f)", trans(estimate), trans(conf.low), trans(conf.high))), display_na = NA),
+  list(width = 0.03, display = ~ ifelse(reference, "", format.pval(p.value, digits = 1, eps = 0.001)), display_na = NA, hjust = 1, heading = "p"),
+  list(width = 0.03)
+)
+
+# Fit Cox model for EFS
+efs_formula <- as.formula('Surv(EFS_Time, EFS_Status) ~ `ARG24 score` + Age + Gender + HSCT + `D5-PBCR` + `ELN2022 (Adv. vs. Fav._Int.)` + `BM Blast` + WBC + HB + PLT + NPM1 + `FLT3-ITD`')
+efs_model <- coxph(efs_formula, data = dat)
+
+# pdf("../03.out/figure5/10.Multivariable_EFS.pdf", width = 7, height = 4)
+print(forest_model(efs_model, panels = forest.panels, factor_separate_line = FALSE))
+# dev.off()
+```
+
+## ARG24 Score and Evolutionary Mutational Combinations in Relapse
+
+ARG24 score is a common hallmark across diverse evolutionary paths to AML relapse after chemotherapy.
+The change of ARG24 score from diagnosis to relapse can also help to contextualize patterns of clonal evolution in AML. For example, in the context of NPM1-mutant AML, FLT3-ITD alterations are recurrently gained at relapse, whereas NRAS and FLT3-TKD alterations are recurrently lost at relapse. Data from Christopher MJ et.al N Engl J Med. 2018.
+
+```{r fig5_mutational_combo_density_boxplot, eval=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggridges)
+library(ggpubr)
+library(readr)
+library(ggrastr)
+library(ggsci)
+
+# Load data
+dat <- read_csv("../02.data/Two_mutations_combination_riskScore_final.csv") %>%
+  select(c("RiskScore", "NPM1 + FLT3-ITD", "NPM1 + FLT3-TKD", "NPM1 + NRAS"))
+
+alteration <- dat %>%
+  gather(key = 'Alteration', value = 'Status', -RiskScore) %>%
+  filter(Status > 0)
+
+# Ridge density plot
+p1 <- alteration %>%
+  ggplot(aes(y = fct_reorder(Alteration, RiskScore), x = RiskScore, fill = stat(x))) +
+  geom_density_ridges_gradient(
+    jittered_points = TRUE, scale = 1.25,
+    position = position_points_jitter(width = 0.05, height = 0),
+    point_shape = '|', point_size = 3, point_alpha = 0.3
+  ) +
+  scale_fill_gradient2(low = "#01665E", high = "#8C510A", midpoint = median(alteration$RiskScore), name = "") +
+  theme_pubr() +
+  ylab('') +
+  xlab('Risk score') +
+  theme(
+    legend.position = 'right',
+    axis.title.x = element_text(size = 15)
+  )
+p1
+# ggsave(p1, filename = "../03.out/figure5/11.NPM1_FLT3_NRAS_arg24.pdf", width = 6, height = 3)
+
+# Boxplot
+alteration$Alteration <- factor(alteration$Alteration, levels = c("NPM1 + FLT3-ITD", "NPM1 + NRAS", "NPM1 + FLT3-TKD"))
+col_val <- pal_nejm(alpha = 0.7)(8)
+
+p2 <- ggplot(data = alteration, aes(x = Alteration, y = RiskScore, color = Alteration)) +
+  geom_violin(alpha = 0.6, width = 1, position = position_dodge(width = 0.8), size = 0.75) +
+  geom_jitter_rast(alpha = 0.6, position = position_jitterdodge(jitter.width = 0.5, jitter.height = 0, dodge.width = 1)) +
+  geom_boxplot(alpha = 0.6, width = 0.2, position = position_dodge(width = 0.8), size = 0.75, outlier.colour = NA) +
+  scale_color_manual(values = col_val[4:6]) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    text = element_text(size = 16),
+    axis.text.x = element_text(angle = 0, hjust = 1, vjust = 1)
+  ) +
+  stat_compare_means(label = "p.format", comparisons = list(c("NPM1 + FLT3-ITD", "NPM1 + NRAS"),
+                                                            c("NPM1 + FLT3-ITD", "NPM1 + FLT3-TKD")), method = 't.test') +
+  ylab("Risk score") +
+  xlab("")
+p2
+# ggsave(p2, filename = "../03.out/figure5/11.NPM1_FLT3_NRAS_arg24_box.pdf", width = 4, height = 4)
+```
+
+## Clonal Dynamics from Diagnosis to Relapse (Fishplots)
+
+```{r fig5_fishplot_196371, eval=TRUE, message=FALSE, warning=FALSE}
+library(rjson)
+library(devtools)
+library(fishplot)
+
+# Patient 196371
+frac.table.CCF = matrix(
+  c(100, 96.6, 44.1, 3.6, 24.6,
+    100, 96.7, 68.5, 59.9, 1.7),
+  ncol = 2)
+parents = c(0, 1, 2, 3, 3)
+timepoints = c(1, 2)
+fish = createFishObject(frac.table.CCF, parents, timepoints = timepoints)
+fish = layoutClones(fish)
+fish = setCol(fish, c("#888888", "#EF0000", "#FF6000", "#7B1732", "#F2B33F"))
+
+# pdf("../03.out/figure5/12.fishplot_196371.pdf", width = 5, height = 3.4)
+fishPlot(fish, shape = "spline", title.btm = "Christopher et al\nPt 196371",
+         cex.title = 0.5, vlines = c(1, 2), bg.type = 'solid', bg.col = 'white',
+         vlab = c("Diagnosis", "Relapse"))
+# dev.off()
+```
+
+```{r fig5_fishplot_327733, eval=TRUE, message=FALSE, warning=FALSE}
+# Patient 327733
+frac.table.CCF = matrix(
+  c(100, 80, 73.8, 70.2, 4.5,
+    100, 92.8, 46.6, 45.7, 30.9),
+  ncol = 2)
+parents = c(0, 1, 2, 3, 4)
+fish = createFishObject(frac.table.CCF, parents, timepoints = timepoints)
+fish = layoutClones(fish)
+
+# pdf("../03.out/figure5/12.fishplot_327733.pdf", width = 5, height = 3.4)
+fishPlot(fish, shape = "spline", title.btm = "Christopher et al\nPt 327733",
+         cex.title = 0.3, vlines = c(1, 2), bg.type = 'solid', bg.col = 'white',
+         vlab = c("Diagnosis", "Relapse"))
+# dev.off()
+```
+
+## ARG24 Score Trajectories in Selected Patients (Dx vs Relapse)
+
+```{r fig5_dx_rel_patient_trajectories, eval=TRUE, message=FALSE, warning=FALSE}
+library(tidyr)
+library(ggplot2)
+dat <- read.csv("../02.data/Christopher_2018_NEJM_Dx_Rel.csv", header = TRUE, check.names = FALSE)
+dat <- dat[!duplicated(dat$Gene), ]
+row.names(dat) <- dat$Gene
+dat <- dat[, -1]
+dat <- log2(dat + 1)
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1)
+inter_gene <- intersect(row.names(dat), row.names(gene.min))
+dat <- dat[inter_gene, ]
+dat <- t(dat)
+gene.min <- data.frame(gene.min[inter_gene, ])
+row.names(gene.min) <- colnames(dat)
+colnames(gene.min) <- "Coef"
+
+calculate_risk_scores <- function(features, coefficients) {
+  scores <- sweep(features, 2, coefficients, `*`)
+  risk_scores <- rowSums(scores)
+  data.frame(risk_score = risk_scores)
+}
+
+dx_rel_arg24 <- calculate_risk_scores(dat, gene.min[, 1])
+dx_rel_arg24$sample <- row.names(dx_rel_arg24)
+dx_rel_arg24 <- separate(dx_rel_arg24, col = "sample", into = c("Patient", "Timepoint"))
+dx_rel_arg24$Timepoint <- gsub("primary", "Diagnosis", dx_rel_arg24$Timepoint)
+dx_rel_arg24$Timepoint <- gsub("post", "Relapse", dx_rel_arg24$Timepoint)
+
+dx_rel_arg24$Patient <- factor(dx_rel_arg24$Patient, levels = c(196371, 327733, 150288, 303642))
+dx_rel_arg24$Timepoint <- factor(dx_rel_arg24$Timepoint, levels = c("Diagnosis", "Relapse"))
+
+p1 <- ggplot(dx_rel_arg24, aes(x = Timepoint, y = risk_score, group = Patient, color = Patient)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ Patient, scales = "free") +
+  labs(x = "Timepoint", y = "Risk Score") +
+  theme_minimal()
+p1
+
+# ggsave(p1, filename = "../03.out/figure5/13.4patients_Dx_Rel.pdf", width = 6, height = 4)
+```
+
+## ARG24 Score Predicts AML Overall Survival (Multi-cohort)
+
+```{r fig5_multicohort_km_dotplot, eval=TRUE, message=FALSE, warning=FALSE}
+library(readxl)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(ggsci)
+library(scales)
+library(ggbreak)
+
+# Load data
+dat <- read_xlsx("../02.data/Survival_multicohorts.xlsx")
+dat <- dat[, c("sample", "RiskScore", "Cohort", "OS_Time", "OS_Status")]
+
+cohorts <- c("RJAML", "GSE146173", "BeatAML", "GSE165656", "Leucegene",  "HOVON", "TCGA-LAML", "GSE37642")
+plots <- list()
+
+for (i in seq_along(cohorts)) {
+  cohort_data <- subset(dat, Cohort == cohorts[i])
+  cohort_data$group <- ifelse(cohort_data$RiskScore >= median(cohort_data$RiskScore), 'High', 'Low')
+  surv_obj <- Surv(cohort_data$OS_Time, cohort_data$OS_Status)
+  surv_fit <- survfit(surv_obj ~ cohort_data$group)
+  surv_diff <- survdiff(surv_obj ~ cohort_data$group)
+  p_val <- 1 - pchisq(surv_diff$chisq, length(surv_diff$n) - 1)
+  hr <- (surv_diff$obs[1] / surv_diff$exp[1]) / (surv_diff$obs[2] / surv_diff$exp[2])
+  hr_ci_low <- exp(log(hr) - qnorm(0.975) * sqrt(1 / surv_diff$exp[2] + 1 / surv_diff$exp[1]))
+  hr_ci_high <- exp(log(hr) + qnorm(0.975) * sqrt(1 / surv_diff$exp[2] + 1 / surv_diff$exp[1]))
+  hr_label <- paste("Hazard Ratio = ", round(hr, 2))
+  ci_label <- paste("95% CI: ", round(hr_ci_low, 2), " - ", round(hr_ci_high, 2))
+  p_val_label <- paste("p =", signif(p_val, 2))
+  plots[[i]] <- ggsurvplot(
+    surv_fit,
+    data = cohort_data,
+    palette = "nejm",
+    pval = paste(p_val_label, hr_label, ci_label, sep = "\n"),
+    pval.size = 5,
+    xlab = "Survival time in days",
+    conf.int = FALSE,
+    risk.table = FALSE,
+    legend.title = paste(cohorts[i], "cohort"),
+    legend.labs = c(
+      paste0("High (N = ", sum(cohort_data$group == "High"), ")"),
+      paste0("Low (N = ", sum(cohort_data$group == "Low"), ")")
+    ),
+    legend = c(0.65, 0.85)
+  )
+}
+
+p <- arrange_ggsurvplots(plots, print = FALSE, ncol = 4, nrow = 2)
+
+# pdf("../03.out/figure5/11.km_plots.pdf", width = 16, height = 8)
+p
+# dev.off()
+
+# Dot plot summary
+library(dplyr)
+tab <- data.frame(
+  Cohort = c("RJAML", "BeatAML", "Leucegene", "TCGA-LAML", "GSE146173", "GSE165656", "HOVON", "GSE37642"),
+  Hazard_Ratio = c(5.59, 2.17, 2.47, 2.13, 1.98, 2.15, 1.33, 1.8),
+  Pvalue = c(1.45e-11, 7.02e-10, 1.30e-05, 4.26e-05, 2.45e-05, 0.00083, 0.0033, 0.0034),
+  Lower = c(3.51, 1.69, 1.63, 1.48, 1.43, 1.33, 1.1, 1.21),
+  Upper = c(8.92, 2.79, 3.76, 3.07, 2.75, 3.48, 1.62, 2.68)
+)
+tab$Cohort <- factor(tab$Cohort, levels = rev(tab$Cohort))
+tab$Test <- "Overall survival"
+
+p1 <- ggplot(tab, aes(x = Hazard_Ratio, y = Cohort)) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.1, color = "black") + 
+  geom_point(aes(fill = -log2(Pvalue), size = Hazard_Ratio), shape = 21) +
+  scale_x_log10() +
+  scale_fill_gradient(low = "white", high = "#8C510A") +
+  facet_wrap(. ~ Test) + 
+  theme_classic() +
+  labs(x = "Hazards Ratio", y = "") +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 0, hjust = 1, color = "black"),
+    panel.grid.major = element_line(size = 0.1, linetype = "dashed", color = "grey"),
+    panel.grid.minor = element_line(size = 0.1, linetype = "dashed", color = "grey")
+  )
+
+p1
+
+# ggsave(p1, filename = "../03.out/figure5/12.Multicohorts_km.pdf", width = 3.8, height = 3)
+```
+
+## Multivariable OS analysis across AML cohorts
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE}
+library(readxl)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(ggsci)
+library(scales)
+library(ggbreak)
+library(forestmodel)
+
+# Load and prepare data
+dat <- read_xlsx("../02.data/Survival_multicohorts.xlsx")
+colnames(dat)[33] <- "FLT3.ITD"  # Ensure consistent naming
+dat$Gender <- ifelse(dat$Gender == "Male", 1, 0)  # Encode Gender
+
+# Define cohorts to be analyzed
+cohorts <- c("RJAML", "GSE146173", "BeatAML", "GSE165656", "Leucegene", "HOVON", "TCGA-LAML", "GSE37642")
+
+# Define forest plot layout
+forest.panels <- list(
+  list(width = 0.01),
+  list(width = 0.1, display = ~variable, fontface = "bold", heading = "Variable"),
+  list(width = 0.1, display = ~level),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.55, item = "forest", hjust = 0.5, heading = "Hazard Ratio", linetype = "dashed", line_x = 0),
+  list(width = 0.03, item = "vline", hjust = 0.5),
+  list(width = 0.12, display = ~ifelse(reference, "Reference",
+                                       sprintf("%0.3f (%0.3f, %0.3f)", trans(estimate), trans(conf.low), trans(conf.high))),
+       display_na = NA),
+  list(width = 0.03, display = ~ifelse(reference, "", format.pval(p.value, digits = 1)),
+       display_na = NA, hjust = 1, heading = "p"),
+  list(width = 0.03)
+)
+
+# Wrapper function for generating forest plots
+create_forest_plot <- function(data, cohort, binary_vars) {
+  formula_str <- paste0("Surv(OS_Time, OS_Status) ~ ", paste(c("RiskScore", "Age", "Gender", binary_vars), collapse = " + "))
+  model <- coxph(as.formula(formula_str), data = data)
+  pdf_filename <- paste0("../03.out/figure5/13.forestplot.os_", tolower(gsub("-", "_", cohort)), ".pdf")
+  pdf(pdf_filename, width = 7, height = 4)
+  print(forest_model(model, panels = forest.panels, factor_separate_line = FALSE))
+  dev.off()
+}
+
+# Cohort-specific modeling
+## RJAML
+dat_rjaml <- subset(dat, Cohort == "RJAML")
+create_forest_plot(dat_rjaml, "RJAML", binary_vars = c("Blast", "WBC", "NPM1", "FLT3.ITD"))
+
+## BeatAML
+dat_beataml <- subset(dat, Cohort == "BeatAML")
+dat_beataml$isDeNovo <- ifelse(dat_beataml$isDeNovo == "Yes", 1, 0)
+create_forest_plot(dat_beataml, "BeatAML", binary_vars = c("Blast", "WBC", "isDeNovo", "NPM1", "FLT3.ITD"))
+
+## Leucegene
+dat_leucegene <- subset(dat, Cohort == "Leucegene")
+create_forest_plot(dat_leucegene, "Leucegene", binary_vars = c("Blast", "NPM1", "FLT3.ITD"))
+
+## TCGA-LAML
+dat_tcga <- subset(dat, Cohort == "TCGA-LAML")
+create_forest_plot(dat_tcga, "TCGA-LAML", binary_vars = c("Blast", "WBC", "NPM1", "FLT3.ITD"))
+
+## GSE146173
+dat_gse146173 <- subset(dat, Cohort == "GSE146173")
+dat_gse146173$isDeNovo <- ifelse(dat_gse146173$isDeNovo == "Yes", 1, 0)
+dat_gse146173$`ELN2017 (Adv. vs. Fav._Int.)` <- ifelse(dat_gse146173$ELN2017 == "Adverse", 1, 0)
+create_forest_plot(dat_gse146173, "GSE146173", binary_vars = c("isDeNovo", "`ELN2017 (Adv. vs. Fav._Int.)`"))
+
+## GSE165656
+dat_gse165656 <- subset(dat, Cohort == "GSE165656")
+dat_gse165656$isDeNovo <- ifelse(dat_gse165656$isDeNovo == "Yes", 1, 0)
+dat_gse165656$`ELN2017 (Adv. vs. Fav._Int.)` <- ifelse(dat_gse165656$ELN2017 == "Adverse", 1, 0)
+create_forest_plot(dat_gse165656, "GSE165656", binary_vars = c("WBC"))
+
+## HOVON
+dat_HOVON <- subset(dat, Cohort == "HOVON")
+dat_HOVON$`Cytogenetic (Poor vs. Good_Int.)` <- ifelse(dat_HOVON$Cytogenetic_risk == "Poor", 1, 0)
+create_forest_plot(dat_HOVON, "HOVON", binary_vars = c("`Cytogenetic (Poor vs. Good_Int.)`", "FAB"))
+
+#-----------------------------------------
+# Summary forest dot plot across cohorts
+#-----------------------------------------
+summary_tab <- data.frame(
+  Cohort = c("RJAML", "BeatAML", "Leucegene", "TCGA-LAML", "GSE146173", "GSE165656"),
+  Hazard_Ratio = c(1.614, 1.337, 1.539, 1.156, 1.199, 1.553),
+  Pvalue = c(2e-14, 3e-08, 2e-06, 0.005, 0.001, 0.002),
+  Lower = c(1.428, 1.207, 1.290, 1.044, 1.076, 1.175),
+  Upper = c(1.825, 1.481, 1.835, 1.280, 1.336, 2.053)
+)
+summary_tab$Cohort <- factor(summary_tab$Cohort, levels = rev(summary_tab$Cohort))
+summary_tab$Test <- "Multivariable overall survival"
+
+# Plot summary dot plot
+p1 <- ggplot(summary_tab, aes(x = Hazard_Ratio, y = Cohort)) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.1, color = "black") +
+  geom_point(aes(fill = -log2(Pvalue), size = Hazard_Ratio), shape = 21) +
+  scale_x_log10() +
+  scale_fill_gradient(low = "white", high = "#01665E") +
+  facet_wrap(. ~ Test) +
+  theme_classic() +
+  labs(x = "Hazard Ratio", y = "") +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    axis.text.x = element_text(color = "black"),
+    panel.grid.major = element_line(size = 0.1, linetype = "dashed", color = "grey"),
+    panel.grid.minor = element_line(size = 0.1, linetype = "dashed", color = "grey")
+  )
+
+p1
+# Save summary plot
+# ggsave(p1, filename = "../03.out/figure5/14.Multicohorts_Multivariable_km.pdf", width = 3.8, height = 3)
+
+```
+

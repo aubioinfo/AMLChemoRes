@@ -1,0 +1,1381 @@
+# Figure 2: Development of the ARG24 Signature and Functional Analysis
+
+## Survival Outcomes Based on Induction Response
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+# Load necessary libraries
+library(readxl)
+library(survival)
+library(survminer)
+library(RColorBrewer)
+
+# Load patient clinical data from RJAML cohort
+mat <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+# library(tableone)
+# 
+# tab1 <- CreateTableOne(
+#   vars = c("Age", "Gender","WBC", "HB", "PLT", "BM Blast", "HSCT", "NPM1", "FLT3-ITD"),
+#   strata = "CR1_response",
+#   data = mat,
+#   factorVars = c("Gender", "HSCT", "NPM1", "FLT3-ITD")
+# )
+# 
+# final_table <- print(tab1, showAllLevels = TRUE)
+# write.csv(final_table, "../02.data/Table1_rjaml.csv")
+
+# Generate survival plots for OS and EFS grouped by clinical response
+plot <- list()
+plot[[1]] <- ggsurvplot(
+  survfit(Surv(OS_Time, OS_Status) ~ Response, data = mat),
+  palette = brewer.pal(8, "Dark2"),
+  pval = TRUE,
+  pval.size = 4,
+  xlab = "Survival time in days",
+  conf.int = FALSE,
+  risk.table = FALSE,
+  surv.median.line = 'hv',
+  legend.title = "Responses to induction",
+  legend.labs = c(
+    paste0("CR1 (N = ", sum(mat$Response == "CR1", na.rm = TRUE), ")"),
+    paste0("CR2 (N = ", sum(mat$Response == "CR2", na.rm = TRUE), ")"),
+    paste0("NCR (N = ", sum(mat$Response == "NCR", na.rm = TRUE), ")")
+  ),
+  legend = c(0.65, 0.85)
+)
+
+plot[[2]] <- ggsurvplot(
+  survfit(Surv(EFS_Time, EFS_Status) ~ Response, data = mat),
+  palette = brewer.pal(8, "Dark2"),
+  pval = TRUE,
+  pval.size = 4,
+  xlab = "Survival time in days",
+  conf.int = FALSE,
+  risk.table = FALSE,
+  surv.median.line = 'hv',
+  legend.title = "Responses to induction",
+  legend.labs = c(
+    paste0("CR1 (N = ", sum(mat$Response == "CR1", na.rm = TRUE), ")"),
+    paste0("CR2 (N = ", sum(mat$Response == "CR2", na.rm = TRUE), ")"),
+    paste0("NCR (N = ", sum(mat$Response == "NCR", na.rm = TRUE), ")")
+  ),
+  legend = c(0.65, 0.85)
+)
+
+# Arrange and print survival plots side-by-side
+p <- arrange_ggsurvplots(plot, print = FALSE, ncol = 2, nrow = 1)
+p
+```
+
+## Differential Expression Analysis Between CR and NCR
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(DESeq2)
+library(readxl)
+sample <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+tpm <- read.table("../02.data/rjaml_all_TPM_matrix.txt", header=T)
+tpm <- subset(tpm, Type %in% c("protein_coding", "miRNA", "lincRNA", "antisense",
+                               "processed_transcript",
+                               "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+                               "transcribed_unprocessed_pseudogene","macro_lncRNA", "TEC",
+                               "3prime_overlapping_ncRNA","sense_intronic", "sense_overlapping",
+                               "unprocessed_pseudogene"))
+tpm <- tpm[, c("ID", "Symbol", "Type", as.character(sample$Tumor_Sample_Barcode))]
+# # filter low-express genes 
+# tpm <- tpm[rowMeans(tpm[,4:ncol(tpm)]) >= 0.05, ]
+# # write.csv(tpm, "RJAML_221_patients_TPM.csv")
+# mat <- read.table("../../rjaml_all_count_matrix.txt", header=TRUE, row.names = 1) 
+# mat <- mat[tpm$ID, as.character(sample$Tumor_Sample_Barcode)]
+# 
+# ## run DESEQ2
+# source("../01.script/RunDESeq2.R")
+# 
+# RunDESeq2(count_mat = mat, n.cont = 157, n.treat = 64, 
+#           prefix = "1_rjaml_DESeq2_out_NCR_CR", sort.p = FALSE, 
+#           merge.normalized = TRUE, 
+#           normalized_mat = tpm)
+
+# data_path <- "../02.data/1_rjaml_DESeq2_out_NCR_CR_with_normalized_mat.txt"
+# deseq_output <- read.table(data_path, header = TRUE)
+# 
+# # Select the first 9 columns for plotting
+# selected_data <- deseq_output[, 1:9]
+# write.csv(selected_data, "../02.data/rjaml_de.out.csv")
+```
+
+## Visualization: Volcano Plot of Differentially Expressed Genes
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(DT)
+source("plotVolcano.R")
+deseq_output <- read.csv("../02.data/rjaml_de.out.csv", header = TRUE)
+
+# Cap extreme log2 fold changes for better visualization
+deseq_output$log2FoldChange[deseq_output$log2FoldChange > 5] <- 5
+deseq_output$padj[deseq_output$padj < 1e-15] <- 1e-15
+
+degs <- subset(deseq_output, padj < 0.05 & abs(log2FoldChange) > 0.5)
+degs$group <- ifelse(degs$log2FoldChange > 0, "Upregulated_in_Resistant", "Upregulated_in_Sensitive")
+table(degs$group)
+
+custom_colors <- brewer.pal(4, "PRGn")  # Color palette
+selected_genes = data.frame(gsym = character(), Pathway = character())
+
+# Generate volcano plot
+volcano_plot <- plotVolcano(
+  data = deseq_output, 
+  gene.col = "Symbol", 
+  logFC.col = "log2FoldChange", pval.col = "padj",
+  logFCcut = 0, logFCcut2 = 0.5, logFCcut3 = 1,
+  pvalCut = 0.05, pvalCut2 = 0.01, pvalCut3 = 0.001,
+  threshold_colors = custom_colors, 
+  plot_mode = "advanced", x_range = c(-5, 5), y_range = c(0, 15),
+  title = "", 
+  label = FALSE,
+  selected_genes = selected_genes
+)
+
+# Print and save the volcano plot
+volcano_plot
+ggsave("../03.out/figure2/02.volcano_plot_patients.pdf", plot = volcano_plot, width = 6, height = 5.5)
+
+# Display data table interactively
+datatable(selected_data, fillContainer = TRUE, options = list(pageLength = 10))
+```
+## Ara-C Responsive Gene Overlap
+
+```{r}
+library(ggvenn)
+library(tidyverse)
+
+patient_df <- read_csv("../02.data/BeatAML_AraC_AUC_Gene_Corr.csv")
+rjaml_df <- read.csv("../02.data/rjaml_de.out.csv")
+rjaml_df <- rjaml_df[!duplicated(rjaml_df$Symbol), ]
+# Rank both
+top_bottom_genes <- function(df) {
+  df <- df %>% arrange(desc(Z_score))
+  top1000 <- df$Symbol[1:1000]
+  bottom1000 <- df$Symbol[(nrow(df) - 999):nrow(df)]
+  unique(na.omit(c(top1000, bottom1000)))
+}
+
+genes_patient <- top_bottom_genes(patient_df)
+genes_rjaml <- subset(rjaml_df, padj < 0.05 & abs(log2FoldChange) > 0.5)$Symbol
+
+gene_sets <- list(
+  Patient = genes_patient,
+  RJAML = genes_rjaml
+)
+
+# Create Venn plot with ggvenn
+p_venn <- ggvenn(
+  gene_sets,
+  # fill_color = c("#E69F00", "#56B4E9"),
+  stroke_size = 0.5,
+  set_name_size = 5,
+  text_size = 4
+)
+p_venn
+# Define gene universe = genes that exist in both datasets
+gene_universe <- intersect(patient_df$Symbol, rjaml_df$Symbol)
+
+# Logical vectors for membership
+in_patient <- gene_universe %in% genes_patient
+in_rjaml <- gene_universe %in% genes_rjaml
+
+# Contingency table and p-value
+contingency <- table(Patient = in_patient, RJAML = in_rjaml)
+fisher_p <- fisher.test(contingency)$p.value
+p_label <- paste0("Fisher's Exact Test\np = ", formatC(fisher_p, format = "e", digits = 2))
+p_label
+
+ggsave(p_venn, filename = "../03.out/figure1/arac_genes_rjaml_overlap.pdf", width = 5, height = 5)
+
+```
+
+## Feature Selection Using LASSO Regression
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+# library(tidyverse)
+# library(survival)
+# library(survminer)
+# library(glmnet)
+# library(pROC)
+
+# # Load data
+# data_path <- "../02.data/rjaml_intersected_tpm.csv"
+# mat <- read.csv(data_path, header = TRUE, row.names = 1)
+# 
+# # Prepare the response variable and feature matrix
+# response <- mat$Group
+# features <- log2(mat[,-1] + 1) %>% as.matrix()
+# 
+# # Initialize variables for cross-validation
+# lambda_values <- numeric(10)
+# set.seed(123)
+# 
+# # Perform 10-fold cross-validation to determine optimal lambda
+# for (i in seq_along(lambda_values)) {
+#   cvfit <- cv.glmnet(features, response, family = "binomial", alpha = 1, nlambda = 1000)
+#   lambda_values[i] <- cvfit$lambda.min
+# }
+# 
+# # Calculate the average lambda from cross-validation
+# optimal_lambda <- mean(lambda_values)
+# 
+# # Fit the final model using the determined lambda
+# final_fit <- glmnet(features, response, family = "binomial", alpha = 1, lambda = optimal_lambda)
+# 
+# # Extract non-zero coefficients from the model
+# coef_info <- as.matrix(coef(final_fit, s = optimal_lambda))
+# significant_genes <- coef_info[coef_info[, 1] != 0, , drop = FALSE]
+# rownames(significant_genes) <- rownames(coef_info)[coef_info[, 1] != 0]
+# 
+# # Identify significant genes and calculate risk scores
+# selected_features <- features[, colnames(features) %in% rownames(significant_genes)]
+# 
+# # Define a function to calculate risk scores based on LASSO results
+# calculate_risk_scores <- function(features, coefficients) {
+#   scores <- sweep(features, 2, coefficients, `*`)
+#   risk_scores <- rowSums(scores)
+#   data.frame(risk_score = risk_scores)
+# }
+# 
+# # Calculate patient risk scores
+# risk_scores <- calculate_risk_scores(selected_features, significant_genes[, 1])
+# 
+# # Combine features and risk scores for output
+# final_data <- cbind(selected_features, risk_scores)
+# 
+# # Save significant genes and the final data with risk scores
+# write.csv(significant_genes, "../02.data/24-gene_signature.csv")
+# write.csv(final_data, "../02.data/24-Gene_RJAML_riskScore.csv")
+```
+
+## Visualization of the ARG24 Gene Signature
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggpubr)
+library(knitr)
+
+# Load data
+gene_data_path <- "../02.data/24-gene_signature.csv"
+gene_signature <- read.csv(gene_data_path, header = TRUE)
+
+# Categorize coefficients into groups 'Pos' or 'Neg'
+gene_signature$group <- ifelse(gene_signature$Coef < 0, "Neg", "Pos")
+
+# Display signature gene table
+knitr::kable(gene_signature)
+
+# Create a bar plot of gene coefficients
+p1 <- ggbarplot(
+  gene_signature, x = "Gene", y = "Coef", fill = "group", color = "white",
+  palette = "jco", sort.val = "asc", sort.by.groups = FALSE, x.text.angle = 60,
+  xlab = "Gene", ylab = "Coefficient", legend.title = "", rotate = FALSE
+) +
+  geom_text(aes(label = sprintf("%.2f", Coef)), vjust = -0.5, color = "black") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print the plot
+p1
+```
+
+## Expression Levels of ARG24 Genes in CR vs NCR Groups
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(ggrastr)
+library(reshape2)
+library(RColorBrewer)
+library(pROC)
+library(tidyverse)
+
+# Read and transform data
+gene_expression_path <- "../02.data/24_gene_tpm_rjaml.csv"
+rj_dat <- read.csv(gene_expression_path, header = TRUE, check.names = FALSE) %>%
+  melt() %>%
+  mutate(value = log2(value + 1))
+rj_dat$Group <- gsub("Refractory", "NCR", rj_dat$Group)
+
+# Create a violin plot
+p <- ggplot(rj_dat, aes(x = Group, y = value, color = Group)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.4, alpha = 0.75, outlier.shape = NA) +
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  facet_wrap(~ variable, scales = "free", nrow = 3) +
+  xlab("") +
+  ylab("Gene expression (log2-transformed)") +
+  scale_color_manual(values = c("CR" = "#1B9E77", "NCR" = "#7570B3")) +
+  theme_pubr(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text.x = element_text(size = 13),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    text = element_text(size = 12)
+  ) +
+  stat_compare_means(comparisons = list(c("CR", "NCR")), method = 'wilcox.test')
+
+# Print and save the plot
+p
+# ggsave(p, filename = "../03.out/figure2/02.24genes_violin.pdf", width = 14, height = 9)
+```
+
+## ARG24 Score Distributions and ROC Analysis
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(pROC)
+library(readxl)
+library(RColorBrewer)
+library(ggplot2)
+library(ggpubr)
+library(tidyverse)
+library(ggrastr)
+
+rj_dat <- read.csv("../02.data/24-Gene_RJAML_riskScore.csv", header = TRUE)
+
+# Violin plot of ARG24 scores by group
+p <- ggplot(rj_dat, aes(x = group2, y = risk_score, color = group2)) + 
+  geom_violin() +
+  geom_boxplot_jitter(width=0.4, alpha=0.75) + 
+  geom_quasirandom_rast(width=0.25, alpha=0.5) +
+  theme_pubr() + 
+  xlab("") + ylab("Risk score") +
+  theme(strip.text.x = element_text(size=13)) +
+  stat_compare_means(comparisons = list(c('CR1', 'CR2'), c('CR1', 'Refractory'), c('CR2', 'Refractory')), method='wilcox.test') + 
+  scale_color_manual(values = c("#1B9E77", "#D95F02", "#7570B3")) +
+  theme(legend.position='None')
+print(p)
+
+# ROC analysis for CR1
+rj_mat <- read.csv("../02.data/rjAML_D5-PBCR.csv", header = TRUE)
+auc1 <- auc(rj_mat$CR1_response, rj_mat$risk_score_binary)
+roc1 <- roc(rj_mat$CR1_response, rj_mat$risk_score_binary)
+auc2 <- auc(rj_mat$CR1_response, rj_mat$risk_score)
+roc2 <- roc(rj_mat$CR1_response, rj_mat$risk_score)
+auc3 <- auc(rj_mat$CR1_response, rj_mat$D5.PBCR)
+roc3 <- roc(rj_mat$CR1_response, rj_mat$D5.PBCR)
+
+plot(roc1, col=brewer.pal(8, "Dark2")[1])
+plot(roc2, add=TRUE, col=brewer.pal(8, "Dark2")[2])
+plot(roc3, add=TRUE, col=brewer.pal(8, "Dark2")[3])
+legend("bottomright", 
+       legend = c(paste0("RiskScore-Binary AUC=", round(auc1, 3)),
+                  paste0("RiskScore-Continuous AUC=", round(auc2, 3)),
+                  paste0("D5-PBCR AUC=", round(auc3, 3))),
+       col = brewer.pal(8, "Dark2")[1:3],
+       lty = 1)
+title(main = "Predictive power in CR1")
+
+# ROC analysis for CR2
+auc4 <- auc(rj_mat$CR2_response, rj_mat$risk_score_binary)
+roc4 <- roc(rj_mat$CR2_response, rj_mat$risk_score_binary)
+auc5 <- auc(rj_mat$CR2_response, rj_mat$risk_score)
+roc5 <- roc(rj_mat$CR2_response, rj_mat$risk_score)
+auc6 <- auc(rj_mat$CR2_response, rj_mat$D5.PBCR)
+roc6 <- roc(rj_mat$CR2_response, rj_mat$D5.PBCR)
+
+plot(roc4, col=brewer.pal(8, "Dark2")[1])
+plot(roc5, add=TRUE, col=brewer.pal(8, "Dark2")[2])
+plot(roc6, add=TRUE, col=brewer.pal(8, "Dark2")[3])
+legend("bottomright", 
+       legend = c(paste0("RiskScore-Binary AUC=", round(auc4, 3)),
+                  paste0("RiskScore-Continuous AUC=", round(auc5, 3)),
+                  paste0("D5-PBCR AUC=", round(auc6, 3))),
+       col = brewer.pal(8, "Dark2")[1:3],
+       lty = 1)
+title(main = "Predictive power in CR2")
+
+# Boxplot by D5-PBCR status
+rj_mat$D5.PBCR <- ifelse(rj_mat$D5.PBCR == "1", "Positive", "Negative")
+p <- ggplot(rj_mat, aes(x = D5.PBCR, y = risk_score, color = D5.PBCR)) + 
+  geom_violin() +
+  geom_boxplot_jitter(width=0.4, alpha=0.75) + 
+  geom_quasirandom_rast(width=0.25, alpha=0.5) +
+  theme_pubr() + 
+  xlab("") + ylab("Risk score") +
+  theme(strip.text.x = element_text(size=13)) +
+  stat_compare_means(comparisons = list(c('Positive', 'Negative')), method='wilcox.test') + 
+  scale_color_manual(values = c("#66A61E", "#E6AB02")) +
+  theme(legend.position='None')
+print(p)
+
+# Fisher test for D5-PBCR vs ARG24 high/low
+matrix_data <- matrix(c(53, 35, 33, 54), ncol = 2, byrow = TRUE)
+colnames(matrix_data) <- c("High-riskScore", "Low-riskScore")
+rownames(matrix_data) <- c("D5-PBCR+", "D5-PBCR-")
+fisher_result <- fisher.test(matrix_data)
+fisher_result
+
+# Overall AUC for ARG24 on CR1 and CR2 groups
+auc1 <- auc(rj_dat$group, rj_dat$risk_score)
+roc1 <- roc(rj_dat$group, rj_dat$risk_score)
+auc2 <- auc(rj_dat$group3, rj_dat$risk_score)
+roc2 <- roc(rj_dat$group3, rj_dat$risk_score)
+
+plot(smooth(roc1), col=brewer.pal(8, "Dark2")[3])
+plot(smooth(roc2), add=TRUE, col=brewer.pal(8, "Dark2")[2])
+legend("bottomright", 
+       legend = c(paste0("CR1 AUC=", round(auc1, 3)),
+                  paste0("CR2 AUC=", round(auc2, 3))),
+       col = c(brewer.pal(8, "Dark2")[3], brewer.pal(8, "Dark2")[2]),
+       lty = 1)
+title(main = "RJAML cohort (N=221)")
+```
+
+## Comparison of ARG24 with LSC17 and PS29MRC Signatures
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(readxl)
+library(dplyr)
+library(pROC)
+library(RColorBrewer)
+
+calculate_risk_scores <- function(features, coefficients) {
+  scores <- sweep(features, 2, coefficients, `*`)
+  risk_scores <- rowSums(scores)
+  data.frame(risk_score = risk_scores)
+}
+
+sample <- read_xlsx("../02.data/0_RJAML_retained_clinical.xlsx")
+tpm <- read.table("../02.data/rjaml_all_TPM_matrix.txt", header=TRUE)
+tpm <- tpm[, c("ID", "Symbol", "Type", as.character(sample$Tumor_Sample_Barcode))]
+
+# LSC17
+lsc17 <- read.table("../02.data/LSC17_signatture.txt", header = TRUE)
+lsc17_mat <- subset(tpm, Symbol %in% lsc17$gene)
+rownames(lsc17_mat) <- lsc17_mat$Symbol
+lsc17_mat <- lsc17_mat[, -c(1:3)]
+lsc17_mat <- lsc17_mat[rownames(lsc17), ]
+lsc17_mat <- log2(t(lsc17_mat) + 1)
+lsc17_scores <- calculate_risk_scores(lsc17_mat, lsc17[, 1])
+colnames(lsc17_scores) <- "LSC17"
+
+# PS29MRC
+ps29mrc <- read.table("../02.data/PS29MRC_signatture.txt", header = TRUE)
+ps29mrc_mat <- subset(tpm, Symbol %in% ps29mrc$gene)
+rownames(ps29mrc_mat) <- ps29mrc_mat$Symbol
+ps29mrc_mat <- ps29mrc_mat[, -c(1:3)]
+ps29mrc_mat <- log2(ps29mrc_mat + 1)
+ps29mrc_mat["MRC_high", ] <- ifelse(sample$Cytogenetic_risk == "Poor", 1, 0)
+ps29mrc_mat["MRC_low", ] <- ifelse(sample$Cytogenetic_risk == "Good", -1, 0)
+ps29mrc <- ps29mrc[rownames(ps29mrc_mat), ]
+ps29mrc_mat <- t(ps29mrc_mat)
+ps29mrc_scores <- calculate_risk_scores(ps29mrc_mat, ps29mrc[, 1])
+colnames(ps29mrc_scores) <- "PS29MRC"
+
+lsc17_ps29mrc <- cbind(lsc17_scores, ps29mrc_scores)
+auc_dat <- cbind(lsc17_ps29mrc, sample[, c("risk_score", "D5-PBCR", "Response", "CR1_response")])
+
+# ROC analysis - CR1
+auc1 <- auc(auc_dat$CR1_response, auc_dat$LSC17)
+roc1 <- roc(auc_dat$CR1_response, auc_dat$LSC17)
+auc2 <- auc(auc_dat$CR1_response, auc_dat$PS29MRC)
+roc2 <- roc(auc_dat$CR1_response, auc_dat$PS29MRC)
+auc3 <- auc(auc_dat$CR1_response, auc_dat$risk_score)
+roc3 <- roc(auc_dat$CR1_response, auc_dat$risk_score)
+
+# pdf("../03.out/figure2/signatures_CR1_comparision.pdf", width = 4, height = 4)
+plot(roc1, col=brewer.pal(8, "Dark2")[1])
+plot(roc2, add=TRUE, col=brewer.pal(8, "Dark2")[2])
+plot(roc3, add=TRUE, col=brewer.pal(8, "Dark2")[3])
+legend("bottomright", 
+       legend = c(paste0("LSC17 AUC=", round(auc1, 3)),
+                  paste0("PS29MRC AUC=", round(auc2, 3)),
+                  paste0("ARG24 AUC=", round(auc3, 3))),
+       col = brewer.pal(8, "Dark2")[1:3],
+       lty = 1)
+title(main = "Predictive power in CR1")
+# dev.off()
+
+# ROC analysis - CR2
+auc_dat$CR2_response <- ifelse(auc_dat$Response == "NCR", "NCR", "CR")
+auc4 <- auc(auc_dat$CR2_response, auc_dat$LSC17)
+roc4 <- roc(auc_dat$CR2_response, auc_dat$LSC17)
+auc5 <- auc(auc_dat$CR2_response, auc_dat$PS29MRC)
+roc5 <- roc(auc_dat$CR2_response, auc_dat$PS29MRC)
+auc6 <- auc(auc_dat$CR2_response, auc_dat$risk_score)
+roc6 <- roc(auc_dat$CR2_response, auc_dat$risk_score)
+
+# pdf("../03.out/figure2/signatures_CR2_comparision.pdf", width = 4, height = 4)
+plot(roc4, col=brewer.pal(8, "Dark2")[1])
+plot(roc5, add=TRUE, col=brewer.pal(8, "Dark2")[2])
+plot(roc6, add=TRUE, col=brewer.pal(8, "Dark2")[3])
+legend("bottomright", 
+       legend = c(paste0("LSC17 AUC=", round(auc4, 3)),
+                  paste0("PS29MRC AUC=", round(auc5, 3)),
+                  paste0("ARG24 AUC=", round(auc6, 3))),
+       col = brewer.pal(8, "Dark2")[1:3],
+       lty = 1)
+title(main = "Predictive power in CR2")
+# dev.off()
+```
+
+## Comparison of ARG24 with D5-PBCR
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+auc_dat1 <- subset(auc_dat, `D5-PBCR` %in% c("Pos", "Neg"))
+auc_dat1$`D5-PBCR` <- ifelse(auc_dat1$`D5-PBCR` == "Pos", 1, 0)
+
+# ROC analysis - CR1
+auc1 <- auc(auc_dat1$CR1_response, auc_dat1$`D5-PBCR`)
+roc1 <- roc(auc_dat1$CR1_response, auc_dat1$`D5-PBCR`)
+auc2 <- auc(auc_dat1$CR1_response, auc_dat1$risk_score)
+roc2 <- roc(auc_dat1$CR1_response, auc_dat1$risk_score)
+
+# pdf("../03.out/figure2/signatures_CR1_D5PBCR.pdf", width = 4, height = 4)
+plot(roc1, col = brewer.pal(8, "Dark2")[1])
+plot(roc2, add = TRUE, col = brewer.pal(8, "Dark2")[2])
+legend("bottomright",
+       legend = c(paste0("D5-PBCR AUC=", round(auc1, 3)),
+                  paste0("ARG24 AUC=", round(auc2, 3))),
+       col = brewer.pal(8, "Dark2")[1:2],
+       lty = 1)
+title(main = "Predictive power in CR1")
+# dev.off()
+
+# ROC analysis - CR2
+auc3 <- auc(auc_dat1$CR2_response, auc_dat1$`D5-PBCR`)
+roc3 <- roc(auc_dat1$CR2_response, auc_dat1$`D5-PBCR`)
+auc4 <- auc(auc_dat1$CR2_response, auc_dat1$risk_score)
+roc4 <- roc(auc_dat1$CR2_response, auc_dat1$risk_score)
+
+# pdf("../03.out/figure2/signatures_CR2_D5PBCR.pdf", width = 4, height = 4)
+plot(roc3, col = brewer.pal(8, "Dark2")[1])
+plot(roc4, add = TRUE, col = brewer.pal(8, "Dark2")[2])
+legend("bottomright",
+       legend = c(paste0("D5-PBCR AUC=", round(auc3, 3)),
+                  paste0("ARG24 AUC=", round(auc4, 3))),
+       col = brewer.pal(8, "Dark2")[1:2],
+       lty = 1)
+title(main = "Predictive power in CR2")
+# dev.off()
+```
+
+## Single cell in primary AML cells that survived after cytarabine treatment or Control
+
+```{r}
+
+# GSE146590
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(stringr)
+library(tidyr)
+library(readr)
+library(Matrix)
+library(ggplot2)
+
+# 1. Data Loading and Preprocessing --------------------------------
+# Get all AML folders (AML1, AML2, etc.)
+data_path <- '/dssg/home/acct-medljm/medljm-jqq/projects/jp_projects/chemoSig/02.data/gse146590_arac_scrna'
+folders <- list.dirs(path = data_path, full.names = TRUE, recursive = FALSE)
+
+# Read each dataset and create Seurat objects
+sceList <- lapply(folders, function(folder) {
+  message("Processing ", basename(folder))
+  
+  # Read components
+  barcodes <- read.table(
+    file.path(folder, "barcodes.tsv.gz"), 
+    header = FALSE,
+    stringsAsFactors = FALSE
+  )[[1]]  # Get first column as cell names
+  
+  features <- read.table(
+    file.path(folder, "features.tsv.gz"),
+    header = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  counts <- readMM(file.path(folder, "matrix.mtx.gz"))
+  
+  # Set proper dimnames
+  rownames(counts) <- features$V1
+  colnames(counts) <- barcodes
+  
+  # Create Seurat object with basic QC
+  CreateSeuratObject(
+    counts = counts,
+    project = basename(folder),
+    min.cells = 3,
+    min.features = 200
+  )
+})
+
+# 2. Data Integration ---------------------------------------------
+# Merge all objects with sample identifiers
+sample_names <- list.dirs(path = data_path, full.names = FALSE, recursive = FALSE)
+gse146590 <- merge(sceList[[1]], y = sceList[-1], add.cell.ids = sample_names)
+
+# Calculate mitochondrial percentage
+gse146590[["percent.mt"]] <- PercentageFeatureSet(gse146590, pattern = "^MT-")
+
+# 3. Robust Gene Annotation Update --------------------------------
+library(org.Hs.eg.db)
+
+# Clean ENSEMBL IDs and get gene symbols
+# 3. Gene Annotation with Duplicate Handling ----------------------
+library(org.Hs.eg.db)
+
+# Clean ENSEMBL IDs and get gene symbols
+ensembl_ids <- sub("\\..*", "", rownames(gse146590))
+symbols <- mapIds(org.Hs.eg.db,
+                 keys = ensembl_ids,
+                 column = "SYMBOL",
+                 keytype = "ENSEMBL",
+                 multiVals = "first")
+
+# Filter genes
+keep_genes <- !is.na(symbols) & 
+             !grepl("^LOC", symbols) & 
+             symbols != ""
+
+# Create new gene names vector
+new_gene_names <- symbols[keep_genes]
+
+# Fast duplicate detection and handling
+if(anyDuplicated(new_gene_names)) {
+  dup_genes <- unique(new_gene_names[duplicated(new_gene_names)])
+  message("Found ", length(dup_genes), " duplicate gene symbols")
+  message("Examples: ", paste(head(dup_genes), collapse = ", "))
+  
+  # Get counts matrix (sparse format)
+  counts_matrix <- GetAssayData(gse146590, layer = "counts")[keep_genes, ]
+  
+  # FAST AGGREGATION (using sparse matrix operations)
+  # Create mapping matrix
+  unique_genes <- unique(new_gene_names)
+  mapping_matrix <- sparseMatrix(
+    i = match(new_gene_names, unique_genes),
+    j = seq_along(new_gene_names),
+    x = 1,
+    dims = c(length(unique_genes), length(new_gene_names))
+  )
+}
+  
+# Aggregate counts (matrix multiplication)
+aggregated_counts <- mapping_matrix %*% counts_matrix
+rownames(aggregated_counts) <- unique_genes
+colnames(aggregated_counts) <- colnames(counts_matrix)
+  
+# Create new assay object
+new_assay <- CreateAssayObject(counts = aggregated_counts)
+if(exists("aggregated_data")) new_assay@data <- aggregated_data
+
+# Replace the assay
+gse146590[["RNA"]] <- new_assay
+
+# 4. Standard Seurat Pipeline -------------------------------------
+# Basic QC filtering (adjust thresholds as needed)
+gse146590 <- subset(gse146590, 
+                   subset = nFeature_RNA > 200 & 
+                           nFeature_RNA < 6000 & 
+                           percent.mt < 15)
+
+# Normalization and feature selection
+gse146590 <- NormalizeData(gse146590)
+gse146590 <- FindVariableFeatures(gse146590, selection.method = "vst", nfeatures = 2000)
+gse146590 <- ScaleData(gse146590, vars.to.regress = c("nFeature_RNA", "percent.mt"))
+
+# Dimensionality reduction
+gse146590 <- RunPCA(gse146590, npcs = 50)
+gse146590 <- RunUMAP(gse146590, dims = 1:15)
+
+# Clustering
+gse146590 <- FindNeighbors(gse146590, dims = 1:30)
+gse146590 <- FindClusters(gse146590, resolution = 1)
+
+
+# 1. Load 24-gene signature and filter to available genes
+gene.min <- read.csv("../02.data/24-gene_signature.csv", 
+                    header = TRUE, 
+                    row.names = 1, 
+                    check.names = FALSE) %>%
+  {.[rownames(.) %in% rownames(gse146590), , drop = FALSE]} 
+
+# Check filtered genes
+message("Using ", nrow(gene.min), " of 24 genes:")
+print(rownames(gene.min))
+
+# 2. Updated risk score function (matrix-safe)
+risk_score <- function(data, lasso_coef) {
+  genes <- intersect(rownames(data), rownames(lasso_coef))
+  expr_matrix <- as.matrix(data[genes, ]) # Ensure matrix format
+  score_mat <- sweep(t(expr_matrix), 2, lasso_coef[genes, 1], `*`)
+  rowSums(score_mat, na.rm = TRUE)
+}
+
+# 3. Calculate scores using updated Seurat syntax
+gse146590@meta.data$sc_ARG24 <- risk_score(
+  GetAssayData(gse146590, assay = "RNA", layer = "data"),
+  gene.min
+)
+
+# save 
+# saveRDS(gse146590, "../02.data/gse146590_arac_scrna/gse146590.rds")
+```
+
+```{r}
+# 5. Visualization ------------------------------------------------
+# UMAP plot colored by sample origin
+gse146590 <- readRDS("../02.data/gse146590_arac_scrna/gse146590.rds")
+
+mycolors <- c('#DCC1DD', '#CCE0F5', '#712820', '#CCC9E6')
+
+umap_sample <- DimPlot(gse146590, reduction = "umap", 
+                       group.by = "orig.ident", 
+                       cols = mycolors) 
+
+# UMAP colored by ARG24 score
+umap_score <- FeaturePlot(gse146590, 
+                         features = "sc_ARG24",
+                         reduction = "umap",
+                         pt.size = 0.5) +
+              scale_color_gradient2(low = "blue", 
+                                   mid = "lightgrey", 
+                                   high = "red",
+                                   midpoint = median(gse146590$sc_ARG24)) +
+              ggtitle("ARG24 Signature Score") 
+umap_score
+
+
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+
+# 1. Compute mean score and p-value
+meta <- gse146590@meta.data
+
+mean_scores <- meta %>%
+  group_by(orig.ident) %>%
+  summarise(mean_ARG24 = mean(sc_ARG24, na.rm = TRUE), .groups = "drop")
+
+# Wilcoxon test between the two groups
+pval <- wilcox.test(sc_ARG24 ~ orig.ident, data = meta)$p.value
+mean_scores$pval <- pval
+
+# Calculate min and max values for consistent scaling
+min_val <- min(mean_scores$mean_ARG24, na.rm = TRUE)
+max_val <- max(mean_scores$mean_ARG24, na.rm = TRUE)
+
+# 2. Plot
+p <- ggplot(mean_scores, aes(x = orig.ident, y = 0)) +
+  geom_point(
+    aes(size = mean_ARG24, fill = mean_ARG24),
+    shape = 21, color = "black", stroke = 0.6
+  ) +
+  geom_text(aes(label = paste0("p = ", signif(pval, 2))), 
+            x = 1.5, y = 0.01, size = 4.5) +
+  scale_fill_gradientn(
+      colors = c("#FFEDA0", "#F03B20"),
+    name = "Mean ARG24",
+    limits = c(min_val, max_val),  # Ensure consistent color mapping
+    guide = guide_colorbar(frame.colour = "black")
+  ) +
+  scale_size_continuous(
+    range = c(2, 6), 
+    name = "Mean ARG24",
+    limits = c(min_val, max_val)   # Ensure size matches color scale
+  ) +
+  labs(
+    x = "",
+    y = "",
+    title = "Mean ARG24 Scores by Group"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.spacing = unit(0.5, "cm")
+  ) +
+  guides(
+    fill = guide_colorbar(order = 1),
+    size = guide_legend(order = 2)
+  )
+
+# Save and display
+p
+
+plots <- umap_sample + umap_score + p
+
+ggsave("../03.out/figure2/ARG24_dot_mean_colored_sized.pdf", plots, width = 11, height = 3)
+
+ggsave("../03.out/figure2/ARG24_dot_mean.pdf", p, width = 4, height = 3)
+
+```
+
+## Resistant K562 cells
+
+```{r}
+library(ggpubr)
+# Load data
+dat <- read.csv("../02.data/gse131823_tpm_k562_resistant.csv", header = TRUE, row.names = 1)
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1)
+
+# Log2 transform TPM values (add pseudocount to avoid -Inf)
+log2tpm <- log2(dat + 1)
+
+# Create sample groups
+sample_groups <- ifelse(grepl("_R", colnames(log2tpm)), "Resistant", "Sensitive")
+
+# Filter to signature genes available in dataset
+sig_genes <- intersect(rownames(gene.min), rownames(log2tpm))
+gene.min_filtered <- gene.min[sig_genes, , drop = FALSE]
+
+message("Using ", length(sig_genes), " of 24 signature genes:")
+print(sig_genes)
+
+# Calculate scores (weighted sum)
+calculate_arg24 <- function(expr_mat, coef_df) {
+  genes <- intersect(rownames(expr_mat), rownames(coef_df))
+  expr_mat <- as.matrix(expr_mat[genes, ])
+  scores <- colSums(expr_mat * coef_df[genes, 1], na.rm = TRUE)
+  return(scores)
+}
+
+arg24_scores <- calculate_arg24(log2tpm, gene.min_filtered)
+
+# 6. Create results DataFrame
+results <- data.frame(
+  Sample = names(arg24_scores),
+  ARG24_Score = arg24_scores,
+  Group = sample_groups
+)
+
+# 7. Add pair information based on sample naming convention
+results <- results %>%
+  mutate(
+    Pair = str_extract(Sample, "K562_[SR]\\d+"),
+    Pair = str_replace(Pair, "K562_[SR]", "Pair_")
+  )
+
+# Enhanced paired dot plot
+paired_plot <- ggpaired(
+  results,
+  x = "Group",
+  y = "ARG24_Score",
+  id = "Pair",
+  color = "Group",
+  line.color = "gray60",
+  line.size = 0.5,
+  point.size = 4,
+  palette = c("#0072B2", "#D55E00")  # color-blind friendly blue/red
+) +
+  labs(
+    title = "Paired Comparison of ARG24 Score in Chemoresistance",
+    y = "ARG24 Score",
+    x = NULL
+  ) +
+  stat_compare_means(
+    paired = FALSE,
+    label.y = max(results$ARG24_Score, na.rm = TRUE) * 1.1,
+    size = 5
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.x = element_text(face = "bold", size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none"
+  )
+
+# Display
+paired_plot
+
+combined_plots <- (umap_sample | umap_score | p | paired_plot) +
+  plot_layout(nrow = 1, widths = c(1.25, 1.25, 1, 0.75))  
+
+ggsave("../03.out/figure2/ARG24_paired_comparisons_K562_Arac.pdf", combined_plots, width = 20, height = 4)
+
+```
+
+## DFS and EFS analysis of ARG24
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(survival)
+library(survminer)
+library(pROC)
+library(corrplot)
+library(RColorBrewer)
+
+dat <- read.csv("../02.data/4_RJAML_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE)
+
+# Initialize empty data frame for statistics
+stat <- data.frame()
+
+# Calculate statistics for each gene
+for (i in 7:ncol(dat)) {
+  tmp <- dat[, c(6, i)]
+  tmp_data <- data.frame(matrix(NA, nrow = 1, ncol = 5))
+  tmp_data[1, 1] <- colnames(tmp)[2]
+  colnames(tmp)[2] <- "Gene"
+
+  # Calculate AUC
+  auc_value <- auc(tmp$Response, tmp$Gene)
+  tmp_data[1, 2] <- as.numeric(auc_value)
+
+  # Subset data for CR and NCR
+  tmp_cr <- subset(tmp, Response == "CR")
+  tmp_ncr <- subset(tmp, Response == "NCR")
+
+  # Perform Wilcoxon test
+  testout <- wilcox.test(tmp_cr$Gene, tmp_ncr$Gene, alternative = "two.sided")
+
+  # Store statistics
+  tmp_data[1, 3:5] <- c(median(tmp_cr$Gene), median(tmp_ncr$Gene), testout$p.value)
+  stat <- rbind(tmp_data, stat)
+}
+
+# Rename columns and calculate log2 fold change
+colnames(stat) <- c("Genes", "AUC", "CR_median", "NCR_median", "P.value")
+stat$log2FC <- log2(stat$NCR_median / stat$CR_median)
+stat <- stat[order(stat$AUC, decreasing = TRUE), ]
+row.names(stat) <- stat[, 1]
+stat <- stat[, -1]
+# Reorder and prioritize DPP4 gene
+stat <- rbind(stat["DPP4", ], stat[!row.names(stat) %in% "DPP4", ])
+
+# Prepare data for corrplot
+corr_dat <- data.frame(auc = stat[, "AUC"])
+row.names(corr_dat) <- row.names(stat)
+p_dat <- data.frame(p.value = stat[, "P.value"])
+row.names(p_dat) <- row.names(stat)
+
+# Define color palette
+colors <- colorRampPalette(brewer.pal(9, 'YlGn'))
+color_continuous <- colors(100)
+
+# Create a correlation plot
+# pdf("../03.out/figure2/03.auc_corrplot.pdf", width = 2, height = 6)
+corrplot(
+  data.matrix(corr_dat),
+  method = "circle",
+  tl.cex = 1,
+  p.mat = data.matrix(p_dat),
+  sig.level = 0.05,
+  insig = "label_sig",
+  pch.col = "black",
+  pch.cex = 1,
+  is.corr = FALSE,
+  tl.col = 'black',
+  cl.ratio = 1,
+  col = color_continuous,
+  col.lim = c(0.55, 0.75)
+)
+# dev.off()
+```
+
+### EFS in RJAML
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(survival)
+library(survminer)
+
+dat <- read.csv("../02.data/4_RJAML_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE, row.names = 1)
+
+# Univariate survival analysis for all genes
+uni_surv_anal <- function(exprSet, clinicData, dataset) {
+  mySurv <- with(clinicData, Surv(Time, Status))
+
+  log_rank_p <- apply(exprSet, 1, function(gene) {
+    clinicData$group <- ifelse(gene >= median(gene), 'high', 'low')
+    data.survdiff <- survdiff(mySurv ~ group, data = clinicData)
+    p.val <- 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
+    return(p.val)
+  })
+
+  cox_results <- apply(exprSet, 1, function(gene) {
+    group <- ifelse(gene >= median(gene), 'high', 'low')
+    survival_dat <- data.frame(group = group, stringsAsFactors = FALSE)
+    m <- coxph(mySurv ~ group, data = survival_dat)
+
+    beta <- -coef(m)
+    se <- sqrt(diag(vcov(m)))
+    HR <- exp(beta)
+    HRse <- HR * se
+
+    tmp <- round(cbind(
+      coef = beta,
+      z = beta / se,
+      HR = HR,
+      HRse = HRse,
+      HRz = (HR - 1) / HRse,
+      HRp = 1 - pchisq(((HR - 1) / HRse)^2, 1),
+      Lower = exp(beta - qnorm(.975, 0, 1) * se),
+      Upper = exp(beta + qnorm(.975, 0, 1) * se)
+    ), 3)
+    return(tmp['grouplow', ])
+  })
+
+  cox_results <- t(cox_results)
+  cox_results <- as.data.frame(cox_results)
+  log_rank_p <- as.data.frame(log_rank_p)
+  cox_results$logrank.P.value <- log_rank_p$log_rank_p
+  write.csv(cox_results, paste0(dataset, "_Uni.Cox.out.csv"))
+}
+
+mat <- dat[, 6:29]
+mat <- data.frame(t(mat))
+clinicData <- dat[, c("EFS_Time", "EFS_Status")]
+colnames(clinicData) <- c("Time", "Status")
+
+uni_surv_anal(mat, clinicData, "../03.out/figure2/01.RJAML_EFS")
+
+cox_result <- read.csv("../03.out/figure2/01.RJAML_EFS_Uni.Cox.out.csv", header = TRUE, row.names = 1, check.names = FALSE)
+cox_result <- cox_result[order(row.names(cox_result)), ]
+```
+
+### DFS in TCGA
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+dat <- read.csv("../02.data/4_TCGA_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE, row.names = 1)
+mat <- dat[, 5:28]
+mat <- data.frame(t(mat))
+clinicData <- dat[, c("DFS_time", "DFS_status")]
+colnames(clinicData) <- c("Time", "Status")
+
+uni_surv_anal(mat, clinicData, "../03.out/figure2/02.TCGA_DFS")
+
+cox_result1 <- read.csv("../03.out/figure2/02.TCGA_DFS_Uni.Cox.out.csv", header = TRUE, row.names = 1, check.names = FALSE)
+cox_result1 <- cox_result1[order(row.names(cox_result1)), ]
+```
+
+```{r}
+# Prepare data for EFS vs DFS corrplot
+corr_dat <- cbind(cox_result[, "HR"], cox_result1[, "HR"])
+row.names(corr_dat) <- row.names(cox_result)
+p_dat <- data.frame(cox_result[, "logrank.P.value"], cox_result1[, "logrank.P.value"])
+row.names(p_dat) <- row.names(cox_result)
+
+# Reorder rows to match previous ordering
+corr_dat <- corr_dat[row.names(stat), ]
+p_dat <- p_dat[row.names(stat), ]
+
+colors <- colorRampPalette(brewer.pal(11, 'RdBu'))
+color_continuous <- rev(colors(100))
+
+corrplot(
+  data.matrix(corr_dat),
+  method = "circle",
+  tl.cex = 1,
+  p.mat = data.matrix(p_dat),
+  sig.level = 0.05,
+  insig = "label_sig",
+  pch.col = "black",
+  pch.cex = 1,
+  is.corr = FALSE,
+  tl.col = 'black',
+  cl.ratio = 1,
+  col = color_continuous,
+  col.lim = c(0.4, 2.2)
+)
+```
+
+## 2.11 Select the DPP4 for Further Validation
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+library(ggpubr)
+library(ggrastr)
+library(RColorBrewer)
+library(tidyverse)
+
+# Load and transform DPP4 expression data
+rj_dat <- read.csv("../02.data/4_RJAML_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE) %>%
+  mutate(DPP4 = log2(DPP4 + 1))
+
+# Generate violin plot
+p <- ggplot(rj_dat, aes(x = Response, y = DPP4, color = Response)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.4, alpha = 0.75, outlier.shape = NA) +
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  xlab("") +
+  ylab("DPP4 expression (log2-transformed)") +
+  scale_color_manual(values = c("CR" = "#1B9E77", "NCR" = "#7570B3")) +
+  theme_pubr(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text.x = element_text(size = 13),
+    axis.text.x = element_text(angle = 0, hjust = 1, vjust = 1),
+    text = element_text(size = 12)
+  ) +
+  stat_compare_means(comparisons = list(c("CR", "NCR")), method = 'wilcox.test')
+
+p
+# ggsave(p, filename = "../03.out/figure2/04.DPP4_violin.pdf", width = 3, height = 3)
+```
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(survival)
+library(survminer)
+library(tidyverse)
+library(patchwork)
+
+# --------- RJAML EFS Survival Analysis ---------
+# Load and preprocess data
+data_rjaml <- read.csv("../02.data/4_RJAML_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE, row.names = 1)
+dat1 <- data_rjaml[, c("EFS_Time", "EFS_Status", "DPP4")]
+colnames(dat1) <- c("Time", "Status", "DPP4")
+dat1$group <- ifelse(dat1$DPP4 >= median(dat1$DPP4, na.rm = TRUE), "High", "Low")
+dat1$group <- factor(dat1$group, levels = c("High", "Low"))
+
+# Survival stats
+surv_diff1 <- survdiff(Surv(Time, Status) ~ group, data = dat1)
+p.val1 <- 1 - pchisq(surv_diff1$chisq, length(surv_diff1$n) - 1)
+HR1 <- (surv_diff1$obs[1] / surv_diff1$exp[1]) / (surv_diff1$obs[2] / surv_diff1$exp[2])
+CI_lower1 <- exp(log(HR1) - qnorm(0.975) * sqrt(1 / surv_diff1$exp[2] + 1 / surv_diff1$exp[1]))
+CI_upper1 <- exp(log(HR1) + qnorm(0.975) * sqrt(1 / surv_diff1$exp[2] + 1 / surv_diff1$exp[1]))
+
+# Plot
+p1 <- ggsurvplot(
+  survfit(Surv(Time, Status) ~ group, data = dat1),
+  palette = "npg",
+  pval = paste0(
+    ifelse(p.val1 < 0.001, "p < 0.001", paste0("p = ", round(p.val1, 4))),
+    "\nHazard Ratio = ", round(HR1, 2),
+    "\n95% CI: ", round(CI_lower1, 2), " - ", round(CI_upper1, 2)
+  ),
+  pval.size = 5,
+  xlab = "Survival time in days",
+  conf.int = FALSE,
+  combine = TRUE,
+  risk.table = FALSE,
+  title = "RJAML EFS",
+  legend.title = "DPP4 score",
+  legend.labs = c(
+    paste0("High (N = ", table(dat1$group)["High"], ")"),
+    paste0("Low  (N = ", table(dat1$group)["Low"], ")")
+  ),
+  legend = c(0.75, 0.85)
+)
+
+# --------- TCGA DFS Survival Analysis ---------
+# Load and preprocess data
+data_tcga <- read.csv("../02.data/4_TCGA_24Gene_Clinical_tpm.csv", header = TRUE, check.names = FALSE, row.names = 1)
+dat2 <- data_tcga[, c("DFS_time", "DFS_status", "DPP4")]
+colnames(dat2) <- c("Time", "Status", "DPP4")
+dat2$group <- ifelse(dat2$DPP4 >= median(dat2$DPP4, na.rm = TRUE), "High", "Low")
+dat2$group <- factor(dat2$group, levels = c("High", "Low"))
+
+# Survival stats
+surv_diff2 <- survdiff(Surv(Time, Status) ~ group, data = dat2)
+p.val2 <- 1 - pchisq(surv_diff2$chisq, length(surv_diff2$n) - 1)
+HR2 <- (surv_diff2$obs[1] / surv_diff2$exp[1]) / (surv_diff2$obs[2] / surv_diff2$exp[2])
+CI_lower2 <- exp(log(HR2) - qnorm(0.975) * sqrt(1 / surv_diff2$exp[2] + 1 / surv_diff2$exp[1]))
+CI_upper2 <- exp(log(HR2) + qnorm(0.975) * sqrt(1 / surv_diff2$exp[2] + 1 / surv_diff2$exp[1]))
+
+# Plot
+p2 <- ggsurvplot(
+  survfit(Surv(Time, Status) ~ group, data = dat2),
+  palette = "npg",
+  pval = paste0(
+    ifelse(p.val2 < 0.001, "p < 0.001", paste0("p = ", round(p.val2, 4))),
+    "\nHazard Ratio = ", round(HR2, 2),
+    "\n95% CI: ", round(CI_lower2, 2), " - ", round(CI_upper2, 2)
+  ),
+  pval.size = 5,
+  xlab = "Survival time in days",
+  conf.int = FALSE,
+  combine = TRUE,
+  risk.table = FALSE,
+  title = "TCGA DFS",
+  legend.title = "DPP4 score",
+  legend.labs = c(
+    paste0("High (N = ", table(dat2$group)["High"], ")"),
+    paste0("Low  (N = ", table(dat2$group)["Low"], ")")
+  ),
+  legend = c(0.75, 0.85)
+)
+
+# Arrange plots
+combined_plot <- arrange_ggsurvplots(list(p1, p2), print = FALSE, ncol = 1, nrow = 2)
+combined_plot
+
+# Save to PDF (optional)
+# ggsave("../03.out/figure6/13.DPP4_survival_combined.pdf", combined_plot, width = 5.5, height = 8)
+```
+
+## 2.12 DE Analysis for RNA-seq with DPP4 Knockdown
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+# library(DESeq2)
+# source("../01.script/RunDESeq2.R")
+# 
+# # Load TPM matrix and filter by gene biotypes
+raw_tpm <- read.table("../02.data/shDPP4_tpm_matrix.txt", header = TRUE, check.names = FALSE)
+tpm <- subset(raw_tpm, Type %in% c(
+  "protein_coding", "miRNA", "lincRNA", "antisense", "processed_transcript",
+  "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+  "transcribed_unprocessed_pseudogene", "macro_lncRNA", "TEC",
+  "3prime_overlapping_ncRNA", "sense_intronic", "sense_overlapping", "unprocessed_pseudogene"
+))
+
+# Filter out lowly expressed genes
+expr_filter <- rowMeans(tpm[, 4:ncol(tpm)]) >= 0.5
+tpm <- tpm[expr_filter, ]
+# 
+# # Load count matrix and match filtered genes
+# mat <- read.table("../02.data/shDPP4_count_matrix.txt", header = TRUE, row.names = 1, check.names = FALSE)
+# mat <- mat[tpm$ID, -c(1:2)]
+# 
+# # Differential expression analysis
+# ## shDPP4-1 vs Control
+# RunDESeq2(
+#   count_mat = mat[, 1:6], n.cont = 3, n.treat = 3,
+#   prefix = "../02.data/shDPP4_1_DESeq2_out", sort.p = FALSE,
+#   merge.normalized = TRUE, normalized_mat = tpm[, 1:9]
+# )
+# 
+# ## shDPP4-2 vs Control
+# RunDESeq2(
+#   count_mat = mat[, c(1:3, 7:9)], n.cont = 3, n.treat = 3,
+#   prefix = "../02.data/shDPP4_2_DESeq2_out", sort.p = FALSE,
+#   merge.normalized = TRUE, normalized_mat = tpm[, c(1:6, 10:12)]
+# )
+# 
+# ## Combined shDPP4 vs Control
+# RunDESeq2(
+#   count_mat = mat, n.cont = 3, n.treat = 6,
+#   prefix = "../02.data/shDPP4_combined_DESeq2_out", sort.p = FALSE,
+#   merge.normalized = TRUE, normalized_mat = tpm
+# )
+```
+
+## 2.13 PCA Analysis
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(scatterplot3d)
+
+# Prepare scaled matrix
+dat <- tpm[, 4:12]
+rownames(dat) <- tpm$ID
+scaled_matrix <- scale(t(dat))
+pca_result <- prcomp(scaled_matrix, scale. = TRUE)
+
+# Define groups and colors
+groups <- c(rep("Scramble", 3), rep("shDPP4-1", 3), rep("shDPP4-2", 3))
+pca_3d_df <- as.data.frame(pca_result$x)
+pca_3d_df$Group <- groups
+group_colors <- c("Scramble" = "red", "shDPP4-1" = "green", "shDPP4-2" = "blue")
+
+# Labels with variance explained
+expl_var <- summary(pca_result)$importance[2, ]
+xlab <- paste0("PC1 (", round(expl_var[1] * 100, 2), "%)")
+ylab <- paste0("PC2 (", round(expl_var[2] * 100, 2), "%)")
+zlab <- paste0("PC3 (", round(expl_var[3] * 100, 2), "%)")
+
+# pdf("../03.out/figure2/05.shDPP4_3D_PCA.pdf", width = 6, height = 6)
+scatterplot3d(
+  pca_3d_df$PC1, pca_3d_df$PC2, pca_3d_df$PC3,
+  color = group_colors[pca_3d_df$Group],
+  pch = 19, angle = 55, grid = TRUE, box = TRUE,
+  xlab = xlab, ylab = ylab, zlab = zlab, main = "3D PCA of TPM Matrix"
+)
+legend("top", legend = names(group_colors), col = group_colors, pch = 19, title = "Groups")
+# dev.off()
+```
+
+## 2.14 Volcano Plots
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(patchwork)
+source("plotVolcano.R")
+selected_genes <- read.csv("../02.data/shDPP4_input_selected.csv", header = TRUE)
+
+# Load DE results
+deseq1 <- read.table("../02.data/shDPP4_1_DESeq2_out_with_normalized_mat.txt", header = TRUE)
+deseq2 <- read.table("../02.data/shDPP4_2_DESeq2_out_with_normalized_mat.txt", header = TRUE)
+
+# Preprocess DE results
+deseq1 <- deseq1[, 1:9]
+deseq1$log2FoldChange <- pmin(deseq1$log2FoldChange, 5)
+deseq1$padj[deseq1$padj < 1e-60] <- 1e-60
+
+deseq2 <- deseq2[, 1:9]
+deseq2$log2FoldChange <- pmax(pmin(deseq2$log2FoldChange, 5), -5)
+deseq2$padj[deseq2$padj < 1e-60] <- 1e-60
+
+# Plot volcano plots
+custom_colors <- brewer.pal(4, "BrBG")
+vp1 <- plotVolcano(
+  data = deseq1, gene.col = "Symbol", logFC.col = "log2FoldChange", pval.col = "padj",
+  selected_genes = selected_genes, logFCcut = 0.5, logFCcut2 = 1, logFCcut3 = 2,
+  pvalCut = 0.05, pvalCut2 = 0.0001, pvalCut3 = 0.00001,
+  threshold_colors = custom_colors, plot_mode = "advanced",
+  x_range = c(-5, 5), y_range = c(0, 60), title = "shDPP4-1 vs. Scramble"
+)
+
+vp2 <- plotVolcano(
+  data = deseq2, gene.col = "Symbol", logFC.col = "log2FoldChange", pval.col = "padj",
+  selected_genes = selected_genes, logFCcut = 0.5, logFCcut2 = 1, logFCcut3 = 2,
+  pvalCut = 0.05, pvalCut2 = 0.0001, pvalCut3 = 0.00001,
+  threshold_colors = custom_colors, plot_mode = "advanced",
+  x_range = c(-5, 5), y_range = c(0, 60), title = "shDPP4-2 vs. Scramble"
+)
+
+combined_plot <- vp1 / vp2
+
+combined_plot
+# ggsave("../03.out/figure2/06.volcano_plot_with_pathways.pdf", plot = combined_plot, width = 18, height = 5.8)
+```
+
+## 2.15 GSEA Analysis
+
+```{r, eval=TRUE, message = FALSE, warning = FALSE}
+library(clusterProfiler)
+library(enrichplot)
+library(GseaVis)
+library(tidyverse)
+
+# Prepare gene list
+deg <- read.table("../02.data/shDPP4_combined_DESeq2_out_with_normalized_mat.txt", header = TRUE)
+geneList <- deg %>%
+  select(Symbol, log2FoldChange) %>%
+  distinct(Symbol, .keep_all = TRUE) %>%
+  drop_na() %>%
+  arrange(desc(log2FoldChange))
+
+gene_list <- geneList$log2FoldChange
+names(gene_list) <- geneList$Symbol
+
+# Load gene sets
+gmt <- read.gmt("../02.data/c2.cp.kegg.v2023.1.Hs.symbols.gmt")
+
+# Run GSEA
+set.seed(123456)
+gsea_result <- GSEA(
+  gene_list, TERM2GENE = gmt, pvalueCutoff = 1, nPermSimple = 10000,
+  maxGSSize = 800, pAdjustMethod = "BH", seed = TRUE
+)
+
+# Plot top pathways
+gsea_result@result$Description <- gsub("KEGG_", "", gsea_result@result$Description)
+
+# pdf("../03.out/figure2/07.shDPP4_GSEA_up.pdf", width = 6, height = 4)
+gseaplot2(
+  gsea_result, subplots = 1:2, pvalue_table = TRUE,
+  geneSetID = c("KEGG_RIBOSOME", "KEGG_OXIDATIVE_PHOSPHORYLATION", "KEGG_DNA_REPLICATION"),
+  title = "Pathways activated by DPP4 knockdown"
+)
+# dev.off()
+
+# pdf("../03.out/figure2/07.shDPP4_GSEA_down.pdf", width = 6, height = 4)
+gseaplot2(
+  gsea_result, subplots = 1:2, pvalue_table = TRUE,
+  geneSetID = c("KEGG_JAK_STAT_SIGNALING_PATHWAY", "KEGG_CHEMOKINE_SIGNALING_PATHWAY"),
+  title = "Pathways repressed by DPP4 knockdown"
+)
+# dev.off()
+```
+

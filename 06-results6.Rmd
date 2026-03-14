@@ -1,0 +1,1485 @@
+# Figure 6: ARG24 score provide theraputic insights
+
+We firstly integrated the drug response data including selective drug sensitivity scores (sDSS) for 515 compounds across 132 samples (also profiled by RNA-seq). The DSS is modified area under the curve values and are calculated as shown in Yadav et al publication (Yadav B et.al, Scientific Reports 2014;4:5193). The selective drug sensitivity scores (sDSS) is healthy control normalized DSS that gives estimated cancer-selective drug responses. The higher the sDSS values indicate drug sensitivities and negative sDSS values represent drug resistance.
+
+## TPM Normalization and Risk Score Calculation (Functional Precision Medicine Tumor Board AML)
+
+```{r fig6_fpm_normalize_tpm, eval=TRUE, message=FALSE, warning=FALSE}
+library(readxl)
+
+count <- read.csv("../02.data/File_8_RNA_seq_Raw_Reads_163S_4Healthy.csv")
+colnames(count)[1] <- "id2"
+length <- read.csv("../02.data/gencode.v22_geneLength.csv")
+
+count <- merge(length, count, by = "id2")
+row.names(count) <- count$id2
+count <- count[, -c(1:5)]
+row.names(length) <- length$id2
+length <- length[row.names(count), ]
+Length <- as.vector(length$length)
+
+TPM <- t(t(count / t(Length)) * 1e6 / colSums(count / t(Length)))
+tpm <- cbind(length, TPM)[, -c(1:3)]
+
+# Save TPM data (optional)
+# write.csv(tpm, "../02.data/File_8_RNA_seq_TPM_163S_4Healthy.csv")
+
+# Load the drug profiling data
+drug <- read.csv("../02.data/File_3_Drug_response_sDSS_164S_17Healthy.csv", header = TRUE, check.names = FALSE)
+samples <- intersect(colnames(tpm), colnames(drug))
+tpm <- tpm[, c("Symbol", "Type", samples)]
+drug <- drug[, c("Drug_name", samples)]
+
+# Identify overlapped samples profiled by RNA-seq and Drug profiling
+samples <- intersect(colnames(tpm), colnames(drug))
+
+# Subset TPM and drug data to include only overlapped samples
+tpm <- tpm[, c("Symbol", "Type", samples)]
+count <- count[, samples]
+drug <- drug[, c("Drug_name", samples)]
+
+gene.min <- read.csv("../02.data/24-gene_signature.csv", row.names = 1)
+mat <- subset(tpm, Symbol %in% rownames(gene.min))
+row.names(mat) <- mat$Symbol
+mat <- data.frame(t(log2(mat[, -c(1,2)] + 1)))
+colnames(mat)[19:20] <- c("INHBA-AS1", "RP5-1119A7.14")
+colnames(mat)[23:24] <- c("UNC5B-AS1", "RP11-158I9.8")
+
+risk_score <- function(dat, candidate_genes, lasso_report) {
+  genes <- intersect(colnames(dat), candidate_genes)
+  weighted <- sweep(dat[, genes], 2, lasso_report[genes, 1], `*`)
+  data.frame(risk_score = rowSums(weighted))
+}
+
+mat_RiskScores <- risk_score(mat, colnames(mat), gene.min)
+drug <- data.frame(t(drug))
+colnames(drug) <- drug[1, ]; drug <- drug[-1, ]
+drug_exp <- cbind(mat_RiskScores, drug)
+# write.csv(drug_exp, "../02.data/Functional_Precision_Medicine_drug_exp.csv")
+
+### Make the matrix for DE analysis
+
+riskscore_quantiles <- quantile(drug_exp$risk_score, probs = c(0.25, 0.75))
+
+# Get sample names
+bottom_25_samples <- rownames(drug_exp)[drug_exp$risk_score <= riskscore_quantiles[1]]
+top_25_samples <- rownames(drug_exp)[drug_exp$risk_score >= riskscore_quantiles[2]]
+
+select_samples <- c(bottom_25_samples, top_25_samples)
+
+# Subset TPM and count data to include only selected samples
+
+tpm <- tpm[, c("Symbol", "Type", select_samples)]
+count <- count[, select_samples]
+# 
+# write.csv(count, "../03.out/figure6/fpmtb_top_bottom_25_count.csv")
+# write.csv(tpm, "../03.out/figure6/fpmtb_top_bottom_25_tpm.csv")
+
+## 2. Create the dot plot with cutoff lines
+# First, create a rank-ordered version of the data
+drug_exp_ranked <- drug_exp[order(drug_exp$risk_score), ]
+drug_exp_ranked$rank <- 1:nrow(drug_exp_ranked)
+
+# Create the plot
+library(ggplot2)
+library(scales)
+library(RColorBrewer)
+
+# Enhanced squish transformation with better handling of extremes
+squish_trans <- function(lower, upper) {
+  trans_new(
+    name = "squish",
+    transform = function(x) {
+      ifelse(x > upper, upper + log10(x - upper + 1),
+             ifelse(x < lower, lower - log10(abs(x - lower) + 1), x))
+    },
+    inverse = function(x) {
+      ifelse(x > upper, 10^(x - upper) + upper - 1,
+             ifelse(x < lower, -10^(abs(x - lower)) + lower + 1, x))
+    }
+  )
+}
+
+# Calculate bounds and risk groups
+lower <- quantile(drug_exp$risk_score, 0.05)
+upper <- quantile(drug_exp$risk_score, 0.95)
+
+# 3. Create the transformation object
+my_trans <- squish_trans(lower, upper)
+
+drug_exp_ranked$risk_group <- cut(drug_exp_ranked$risk_score,
+                                 breaks = c(-Inf, riskscore_quantiles[1], 
+                                           riskscore_quantiles[2], Inf),
+                                 labels = c("Low 25%", "Middle 50%", "High 25%"))
+
+# Create the plot with enhanced aesthetics
+p <- ggplot(drug_exp_ranked, aes(x = rank, y = risk_score, 
+                                color = risk_group, size = risk_score)) +
+  geom_point(alpha = 0.7, shape = 19) +  # Use filled circles with transparency
+  
+  # Improved quantile lines
+  geom_hline(yintercept = riskscore_quantiles, 
+             linetype = "dashed", linewidth = 0.8,
+             color = c("#E41A1C", "#377EB8")) +
+  
+  # Color scale (ColorBrewer palette)
+  scale_color_manual(values = c("#E41A1C", "#4DAF4A", "#377EB8"),
+                    name = "Risk Group") +
+  
+  # Size scale for dots
+  scale_size_continuous(range = c(1.5, 5), 
+                       guide = guide_legend(title = "Risk Score")) +
+  
+  # Squish transformation for y-axis
+  scale_y_continuous(trans = my_trans,  # Use the pre-defined transformation
+                    breaks = pretty_breaks(n = 8),
+                    expand = expansion(mult = 0.05)) +
+  
+  # Labels and theme
+  labs(x = "Sample Rank", 
+       y = "Risk Score (compressed extremes)",
+       title = "Risk Score Distribution",
+       subtitle = "Dashed lines indicate top/bottom 25% percentiles") +
+  
+  # Professional theme
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.box = "vertical",
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    axis.title = element_text(face = "bold")
+  )
+
+# Add annotation for quantiles
+p <- p + annotate("text", x = Inf, y = riskscore_quantiles[1], 
+                 label = "25th percentile", hjust = 1.1, vjust = -0.5,
+                 color = "#E41A1C", size = 3.5) +
+         annotate("text", x = Inf, y = riskscore_quantiles[2], 
+                 label = "75th percentile", hjust = 1.1, vjust = -0.5,
+                 color = "#377EB8", size = 3.5)
+
+p
+```
+
+## Correlation Between ARG24 Score and Drug Sensitivity (FPMTB Dataset)
+
+```{r fig6_fpm_drug_correlation_volcano, eval=TRUE, message=FALSE, warning=FALSE}
+library(corrplot)
+library(RColorBrewer)
+library(EnhancedVolcano)
+
+drug_exp <- read.csv("../02.data/Functional_Precision_Medicine_drug_exp.csv", row.names = 1, check.names = FALSE)
+
+stat1 <- data.frame(ID = colnames(drug_exp)[-1])
+stat1$P.value <- NA
+stat1$rho <- NA
+for (i in 2:ncol(drug_exp)) {
+  test <- cor.test(drug_exp[, 1], drug_exp[, i])
+  stat1$P.value[i - 1] <- test$p.value
+  stat1$rho[i - 1] <- test$estimate
+}
+stat1$fdr <- p.adjust(stat1$P.value, method = "BH")
+row.names(stat1) <- stat1$ID
+
+# pdf("../03.out/figure6/01.fpm_drugs_valcano.pdf", width = 6.2, height = 8)
+EnhancedVolcano(
+  stat1,
+  lab = rownames(stat1),
+  selectLab = subset(stat1, P.value < 0.05 & abs(rho) > 0.1)$ID,
+  x = 'rho',
+  y = 'P.value',
+  xlab = 'Correlation with drug sensitivity (sDSS)',
+  pCutoff = 0.05,
+  FCcutoff = 0.2,
+  xlim = c(-0.4, 0.4),
+  ylim = c(0, 3)
+)
+# dev.off()
+
+significant <- subset(stat1, P.value < 0.05 & abs(rho) > 0.2)
+significant <- significant[order(significant$rho, decreasing = TRUE), ]
+corr_dat <- data.frame(rho = significant$rho)
+p_dat <- data.frame(p.value = significant$P.value)
+row.names(corr_dat) <- row.names(p_dat) <- row.names(significant)
+
+# pdf("../03.out/figure6/02.fpm_drugs_colplot.pdf", width = 3, height = 5)
+corrplot(
+  data.matrix(corr_dat), 
+  method = "circle",
+  p.mat = data.matrix(p_dat),
+  sig.level = 0.05,
+  insig = "label_sig",
+  tl.col = 'black',
+  col = colorRampPalette(brewer.pal(11, 'PRGn'))(100),
+  col.lim = c(-0.75, 0.75)
+)
+# dev.off()
+```
+
+## Representative Scatter Plots for Verdinexor and Selinexor (FPM Dataset)
+
+```{r fig6_fpm_scatter_selinexor_verdinexor, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+library(patchwork)
+
+mat <- read.csv("../02.data/Functional_Precision_Medicine_drug_exp.csv", row.names = 1, check.names = FALSE)
+
+make_scatter <- function(df, drug_name) {
+  ggscatter(
+    na.omit(df[, c("risk_score", drug_name)]),
+    x = "risk_score", y = drug_name,
+    size = "risk_score", color = drug_name,
+    alpha = 0.5,
+    add = "reg.line", 
+    add.params = list(color = "grey", fill = "lightgray"),
+    conf.int = TRUE,
+    cor.coef = TRUE,
+    cor.coeff.args = list(method = "pearson", label.x = 2, label.sep = "\n")
+  ) +
+    theme_bw() +
+    scale_color_gradient(low = "#CCECE6", high = "#006D2C") +
+    labs(
+      title = "Functional Precision Medicine Tumor Board AML",
+      x = "ARG24 Score (Chemotherapy resistance)", 
+      y = paste0("Ex vivo ", drug_name, " sensitivity (sDSS)")
+    )
+}
+
+p1 <- make_scatter(mat, "Verdinexor")
+p2 <- make_scatter(mat, "Selinexor")
+combined <- p1 / p2
+combined
+# ggsave(combined, filename = "../03.out/figure6/03.fpm_selino_colplot.pdf", width = 4.5, height = 7.4)
+```
+
+## Drug Correlation Analysis in BeatAML Dataset
+
+```{r fig6_beataml_correlation_analysis, eval=TRUE, message=FALSE, warning=FALSE}
+library(corrplot)
+library(readxl)
+library(RColorBrewer)
+library(EnhancedVolcano)
+
+t1 <- read.csv("../02.data/BeatAML_riskScore_corr_input.csv", header = TRUE, row.names = 1, check.names = FALSE)
+t1 <- t1[, -c(1:3)]
+
+stat2 <- data.frame(ID = colnames(t1)[-1])
+stat2$P.value <- NA
+stat2$rho <- NA
+for (i in 2:ncol(t1)) {
+  res <- cor.test(t1[, 1], -1 * t1[, i], method = "pearson")
+  stat2$P.value[i - 1] <- res$p.value
+  stat2$rho[i - 1] <- res$estimate
+}
+
+stat2$fdr <- p.adjust(stat2$P.value, method = "BH")
+row.names(stat2) <- stat2$ID
+
+# pdf("../03.out/figure6/04.beataml_drugs_valcano.pdf", width = 6.2, height = 8)
+EnhancedVolcano(
+  stat2,
+  lab = rownames(stat2),
+  x = 'rho',
+  y = 'P.value',
+  xlab = 'Correlation with drug sensitivity (-AUC value)',
+  pCutoff = 0.05,
+  FCcutoff = 0.1,
+  xlim = c(-0.3, 0.3),
+  ylim = c(0, 4)
+)
+# dev.off()
+
+stat2 <- subset(stat2, P.value < 0.05 & abs(rho) > 0.1)
+stat2 <- stat2[order(stat2$rho, decreasing = TRUE), ]
+corr_dat <- data.frame(rho = stat2$rho)
+p_dat <- data.frame(p.value = stat2$P.value)
+row.names(corr_dat) <- row.names(p_dat) <- row.names(stat2)
+
+# pdf("../03.out/figure6/05.beataml_drugs_colplot.pdf", width = 2, height = 3)
+corrplot(
+  data.matrix(corr_dat),
+  method = "circle",
+  tl.cex = 1,
+  p.mat = data.matrix(p_dat),
+  sig.level = 0.05,
+  insig = "label_sig",
+  pch.col = "black",
+  pch.cex = 1,
+  is.corr = FALSE,
+  tl.col = 'black',
+  cl.ratio = 0.5,
+  col = colorRampPalette(brewer.pal(11, 'BrBG'))(100),
+  col.lim = c(-0.3, 0.3)
+)
+# dev.off()
+```
+
+```{r}
+library(tidyverse)
+library(GSVA)
+library(GSEABase)
+library(dplyr)
+library(tibble)
+
+# Read data and preprocess
+mat <- read.csv("../03.out/figure6/beataml_400_tpm.csv", header = T, row.names = 1)
+
+# Step-by-step safe transformation
+mat_processed <- mat %>%
+  as_tibble() %>%
+  mutate(
+    avg_expr = rowMeans(across(-c(Symbol, Type)), na.rm = TRUE)
+  ) %>%
+  arrange(desc(avg_expr)) %>%
+  distinct(Symbol, .keep_all = TRUE) %>%
+  column_to_rownames("Symbol") %>%
+  dplyr::select(-Type, -avg_expr)
+
+# Log2 transform (add pseudocount to avoid -Inf)
+mat_log <- log2(mat_processed + 1)
+
+# Read gene sets
+gene.set <- getGmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Set matrixStats options to avoid warning
+options(matrixStats.useNames = TRUE) 
+
+# Run GSVA with proper parameters
+mat_log <- as.matrix(mat_log)
+gsvapar <- gsvaParam(mat_log, gene.set, maxDiff=TRUE)
+gsva_es <- gsva(gsvapar)
+gsva_es <- data.frame(t(gsva_es))
+
+# Save results
+write.csv(gsva_es, "../03.out/figure6/gsva_nuclear_export_pathways_results_beataml.csv")
+```
+
+
+### Select the top 25% and bottom 25%
+
+```{r}
+# Create the plot
+library(ggplot2)
+library(scales)
+library(RColorBrewer)
+
+df <- read.csv("../02.data/BeatAML_riskScore_corr_input.csv", header = TRUE, row.names = 1, check.names = FALSE)
+
+riskscore_quantiles <- quantile(df$risk_score, probs = c(0.25, 0.75))
+
+# Get sample names
+bottom_25_samples <- rownames(df)[df$risk_score <= riskscore_quantiles[1]]
+top_25_samples <- rownames(df)[df$risk_score >= riskscore_quantiles[2]]
+
+select_samples <- c(bottom_25_samples, top_25_samples)
+
+# Subset TPM and count data to include only selected samples
+count <- read.csv("../03.out/figure6/beataml_400_count.csv", header = T, row.names = 1)
+tpm <- read.csv("../03.out/figure6/beataml_400_tpm.csv", header = T, row.names = 1)
+
+tpm <- tpm[, c("ID", "Symbol", "Type", select_samples)]
+count <- count[, select_samples]
+# 
+# write.csv(count, "../03.out/figure6/beataml_top_bottom_25_count.csv")
+# write.csv(tpm, "../03.out/figure6/beataml_top_bottom_25_tpm.csv")
+
+## 2. Create the dot plot with cutoff lines
+# First, create a rank-ordered version of the data
+df_ranked <- df[order(df$risk_score), ]
+df_ranked$rank <- 1:nrow(df_ranked)
+
+# Enhanced squish transformation with better handling of extremes
+squish_trans <- function(lower, upper) {
+  trans_new(
+    name = "squish",
+    transform = function(x) {
+      ifelse(x > upper, upper + log10(x - upper + 1),
+             ifelse(x < lower, lower - log10(abs(x - lower) + 1), x))
+    },
+    inverse = function(x) {
+      ifelse(x > upper, 10^(x - upper) + upper - 1,
+             ifelse(x < lower, -10^(abs(x - lower)) + lower + 1, x))
+    }
+  )
+}
+
+# Calculate bounds and risk groups
+lower <- quantile(df$risk_score, 0.05)
+upper <- quantile(df$risk_score, 0.95)
+
+# 3. Create the transformation object
+my_trans <- squish_trans(lower, upper)
+
+df_ranked$risk_group <- cut(df_ranked$risk_score,
+                     breaks = c(-Inf, riskscore_quantiles[1], 
+                                riskscore_quantiles[2], Inf),
+                     labels = c("Low 25%", "Middle 50%", "High 25%"))
+
+# Create the plot with enhanced aesthetics
+p <- ggplot(df_ranked, aes(x = rank, y = risk_score, 
+                                color = risk_group, size = risk_score)) +
+  geom_point(alpha = 0.7, shape = 19) +  # Use filled circles with transparency
+  
+  # Improved quantile lines
+  geom_hline(yintercept = riskscore_quantiles, 
+             linetype = "dashed", linewidth = 0.8,
+             color = c("#E41A1C", "#377EB8")) +
+  
+  # Color scale (ColorBrewer palette)
+  scale_color_manual(values = c("#E41A1C", "#4DAF4A", "#377EB8"),
+                    name = "Risk Group") +
+  
+  # Size scale for dots
+  scale_size_continuous(range = c(1.5, 5), 
+                       guide = guide_legend(title = "Risk Score")) +
+  
+  # Squish transformation for y-axis
+  scale_y_continuous(trans = my_trans,  # Use the pre-defined transformation
+                    breaks = pretty_breaks(n = 8),
+                    expand = expansion(mult = 0.05)) +
+  
+  # Labels and theme
+  labs(x = "Sample Rank", 
+       y = "Risk Score (compressed extremes)",
+       title = "Risk Score Distribution",
+       subtitle = "Dashed lines indicate top/bottom 25% percentiles") +
+  
+  # Professional theme
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    legend.box = "vertical",
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    axis.title = element_text(face = "bold")
+  )
+
+# Add annotation for quantiles
+p <- p + annotate("text", x = Inf, y = riskscore_quantiles[1], 
+                 label = "25th percentile", hjust = 1.1, vjust = -0.5,
+                 color = "#E41A1C", size = 3.5) +
+         annotate("text", x = Inf, y = riskscore_quantiles[2], 
+                 label = "75th percentile", hjust = 1.1, vjust = -0.5,
+                 color = "#377EB8", size = 3.5)
+
+p
+```
+
+
+## Selinexor Sensitivity vs. ARG24 Score in BeatAML Dataset
+
+```{r fig6_beataml_selinexor_scatter, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+
+mat <- read.csv("../02.data/BeatAML_riskScore_corr_input.csv", header = TRUE, row.names = 1, check.names = FALSE)
+mat$neg_Selinexor <- -1 * mat$Selinexor
+
+p3 <- ggscatter(
+  na.omit(mat[, c("risk_score", "neg_Selinexor", "Selinexor")]),
+  x = "risk_score",
+  y = "neg_Selinexor",
+  size = "risk_score",
+  color = "neg_Selinexor",
+  alpha = 0.5,
+  title = "BeatAML",
+  add = "reg.line",
+  add.params = list(color = "grey", fill = "lightgray"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.x = 2, label.sep = "\n")
+) +
+  theme_bw() +
+  scale_color_gradient(low = "#C6DBEF", high = "#01665E") +
+  labs(
+    x = "ARG24 Score (Chemotherapy resistance)",
+    y = "Ex vivo Selinexor sensitivity (-AUC)"
+  )
+
+p3
+# ggsave(p3, filename = "../03.out/figure6/06.beataml_selino_colplot.pdf", width = 4.5, height = 3.3)
+```
+
+## Correlation Between ARG24 Score and XPO1 Expression in each cohort
+
+```{r fig6_xpo1_expression_correlation, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+library(patchwork)
+
+dat <- read.csv("../02.data/XPO1_ARG24_cor_mat.csv", header = TRUE, row.names = 1, check.names = FALSE)
+dat$XPO1 <- log2(dat$XPO1 + 1)
+
+p4 <- ggscatter(
+  dat,
+  x = "RiskScore",
+  y = "XPO1",
+  color = "Cohort",
+  alpha = 0.5,
+  add = "reg.line",
+  add.params = list(color = "grey", fill = "lightgray"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.x = 2, label.sep = "\n")
+) +
+  theme_bw() +
+  facet_wrap(. ~ Cohort) +
+  labs(
+    x = "ARG24 Score (Chemotherapy resistance)",
+    y = "XPO1 expression"
+  )
+
+p4
+
+mat <- read.csv("../02.data/XPO1_ARG24_cor_CCLE_AML_cell-lines.csv", header = TRUE)
+mat$XPO1 <- log2(mat$XPO1)
+
+p5 <- ggscatter(
+  mat,
+  x = "risk_score",
+  y = "XPO1",
+  color = "XPO1",
+  alpha = 0.5,
+  add = "reg.line",
+  add.params = list(color = "grey", fill = "lightgray"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.x = 2, label.sep = "\n")
+) +
+  theme_bw() +
+  scale_color_gradient(low = "#FEE8C8", high = "#D7301F") +
+  labs(
+    x = "ARG24 Score (Chemotherapy resistance)",
+    y = "XPO1 expression"
+  )
+
+p5
+
+# plots <- p4 | p5
+# plots
+# ggsave(plots, filename = "../03.out/figure6/07.arg24_xpo1.pdf", width = 8, height = 3.3)
+```
+
+## Detailed Visualization: ARG24 Score vs. XPO1 Expression (Scatter, Density, and Group Comparison)
+
+```{r eval=TRUE, message = FALSE, warning = FALSE}
+library(ggpubr)
+library(ggplot2)
+library(ggExtra)
+library(patchwork)
+library(ggrastr)
+library(tidyverse)
+library(ggstatsplot)
+library(RColorBrewer)
+
+# Load and preprocess the dataset
+dat <- read.csv("../02.data/XPO1_ARG24_cor_mat.csv", header = TRUE, row.names = 1, check.names = FALSE)
+dat$XPO1 <- log2(dat$XPO1 + 1)
+dat$ARG24_group <- ifelse(dat$RiskScore >= median(dat$RiskScore), "High", "Low")
+dat$ARG24_group <- factor(dat$ARG24_group, levels = c("Low", "High"))
+col <- brewer.pal(2, "Set2")
+
+## Panel A: Scatter plot with density margin
+p1 <- ggplot(dat, aes(x = RiskScore, y = XPO1, color = ARG24_group)) +
+  geom_point(aes(size = RiskScore, shape = Cohort), alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = col[3]) +
+  scale_color_manual(values = col) +
+  labs(x = "ARG24 Score", y = "XPO1 expression") +
+  theme_bw()
+
+# Pearson correlation test
+stat <- cor.test(dat$RiskScore, dat$XPO1, method = "pearson")
+lab <- paste0("R = ", round(stat$estimate, 3), "\nP = ", signif(stat$p.value, 3))
+
+# Annotate correlation results on the plot
+p2 <- p1 + annotate("text", x = 1.2, y = 0.55, label = lab)
+
+# Add marginal density plots
+p3 <- ggMarginal(p2, type = "density", groupColour = TRUE, groupFill = TRUE)
+
+# Display Panel A
+p3
+# ggsave(p3, filename = "../03.out/figure6/08.arg24_xpo1_allcohorts.pdf", width = 5.4, height = 4.2)
+
+
+## Panel B: Group-wise comparison using violin + boxplot
+p_violin <- ggplot(dat, aes(x = ARG24_group, y = XPO1, color = ARG24_group)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.4, alpha = 0.75, outlier.shape = NA) +
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  scale_color_manual(values = c("Low" = col[1], "High" = col[2])) +
+  labs(x = NULL, y = "XPO1 expression (log2-transformed)") +
+  theme_pubr(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 1, vjust = 1),
+    text = element_text(size = 12)
+  ) +
+  stat_compare_means(comparisons = list(c("Low", "High")), method = 'wilcox.test')
+
+# Display Panel B
+p_violin
+# ggsave(p_violin, filename = "../03.out/figure6/09.xpo1_arg24_group.pdf", width = 2, height = 3.6)
+```
+
+## Selinexor Drug Response Curves
+
+```{python}
+# import pandas as pd
+# import numpy as np
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+# from scipy.optimize import curve_fit
+# from pathlib import Path
+# 
+# # Load the Excel file
+# file_path = Path("../data/selinexor_IC50_2024.10.15_longFormat.xlsx")
+# df = pd.read_excel(file_path)
+# 
+# # Reshape the data to long format
+# df_long = df.melt(id_vars=["Selinexor", "Cell_line"], 
+#                   value_vars=["Rep1", "Rep2", "Rep3"],
+#                   var_name="Replicate", value_name="Viability")
+# 
+# # Define 4-parameter logistic function
+# def four_param_logistic(x, a, b, c, d):
+#     return d + (a - d) / (1 + (x / c)**b)
+# 
+# # Fit and plot curves
+# cell_lines = df_long["Cell_line"].unique()
+# ic50_results = []
+# 
+# # Initialize figure
+# fig, ax = plt.subplots(figsize=(10, 6))
+# sns.set(style="whitegrid")
+# 
+# for cell_line in cell_lines:
+#     data = df_long[df_long["Cell_line"] == cell_line]
+#     xdata = data["Selinexor"].values
+#     ydata = data["Viability"].values
+# 
+#     try:
+#         # Fit curve
+#         popt, _ = curve_fit(four_param_logistic, xdata, ydata, 
+#                             bounds=([0, 0, 0, 0], [200, 10, 100, 200]), 
+#                             p0=[100, 1, 1, 0])
+#         a, b, c, d = popt
+#         ic50_results.append({"Cell_line": cell_line, "IC50": c})
+#         
+#         # Generate fitted curve
+#         xfit = np.logspace(np.log10(min(xdata[xdata > 0])), np.log10(max(xdata)), 100)
+#         yfit = four_param_logistic(xfit, *popt)
+#         ax.plot(xfit, yfit, label=f"{cell_line} (IC50={c:.3f})")
+#         
+#         # Raw data
+#         sns.scatterplot(x="Selinexor", y="Viability", data=data, ax=ax, label=f"{cell_line} raw", alpha=0.6)
+#     except RuntimeError:
+#         ic50_results.append({"Cell_line": cell_line, "IC50": np.nan})
+#         print(f"Could not fit curve for {cell_line}")
+# 
+# # Finalize plot
+# ax.set_xscale("log")
+# ax.set_xlabel("Selinexor (µM)")
+# ax.set_ylabel("Cell Viability (%)")
+# ax.set_title("Drug Response Curves for Selinexor")
+# ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+# plt.tight_layout()
+# 
+# # Save to PDF
+# pdf_path = "../out/figure6/Selinexor_Drug_Response_Curves.pdf"
+# fig.savefig(pdf_path)
+
+```
+
+## ARG24 Score vs. Selinexor IC50 in AML Cell Lines
+
+```{r fig6_arg24_selinexor_ic50, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+library(reshape2)
+library(patchwork)
+library(ggplot2) 
+
+# Load risk score and IC50 data
+mat <- read.csv("../02.data/risk_score_XPO1_IC50.csv", header = TRUE)
+
+# Scatter plot: ARG24 score vs. Selinexor IC50
+p1 <- ggscatter(
+  data = mat,
+  x = "risk_score",
+  y = "Selinexor_IC50",
+  color = "Selinexor_IC50",
+  size = 3,
+  alpha = 0.5,
+  add = "reg.line",
+  add.params = list(color = "#666666", fill = "lightgray"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.sep = "\n")
+) +
+  theme_bw() +
+  labs(
+    x = "ARG24 Score",
+    y = "IC50 (Selinexor)"
+  ) +
+  scale_color_gradient(low = "#E7D4E8", high = "#762A83") +
+  geom_text(aes(label = Cell_Line), hjust = 0.5, vjust = -1, size = 3, color = "black")
+
+p1
+
+# Save plot to file (uncomment to activate)
+# ggsave(p1, filename = "../03.out/figure6/10.risk_score_AML_cells_IC50.pdf", width = 5.1, height = 3.8)
+```
+
+## ARG24 Score vs. Selinexor IC50 in Patients
+
+```{r fig6_patient_qpcr_heatmap, eval=TRUE, message=FALSE, warning=FALSE}
+library(pheatmap)
+
+# Step 1: Load gene expression (qPCR) and gene coefficient data
+dat <- read.csv("../02.data/patient_selinexor_pcr_gapdh.csv", header = TRUE, row.names = 1, check.names = FALSE)
+row.names(dat) <- paste0("P", 1:8)
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1, check.names = FALSE)
+
+# Step 2: Ensure gene order and subset
+genes <- rownames(gene.min)
+dat <- dat[, genes]
+
+# Step 3: Calculate ARG24 score
+calculate_risk_scores <- function(features, coefficients) {
+  scores <- sweep(features, 2, coefficients, `*`)
+  data.frame(ARG24 = rowSums(scores))
+}
+
+rjaml_pcr <- calculate_risk_scores(dat, gene.min[, "Coef"])
+
+# Step 4: Reorder data by ARG24 score
+dat_ordered <- dat[order(rjaml_pcr$ARG24, decreasing = TRUE), ]
+
+# Step 5: IC50 values and alignment
+ic50 <- data.frame(IC50 = c(0.7288, 1.440, 4.112, 3.365, 1.443, 1.643, 1.120, 1.938))
+row.names(ic50) <- row.names(dat)
+ic50_ordered <- ic50[rownames(dat_ordered), ]
+
+# Step 6: Annotation for heatmap
+annotation_row <- data.frame(
+  ARG24 = rjaml_pcr$ARG24,
+  LogIC50 = ic50$IC50
+)
+row.names(annotation_row) <- row.names(dat)
+
+# Step 7: Plot heatmap
+# pdf("../03.out/figure6/11.qpcr_heatmap.pdf", width = 6, height = 3)
+pheatmap(
+  dat_ordered,
+  scale = "row",
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  annotation_row = annotation_row,
+  fontsize_row = 10,
+  fontsize_col = 8,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  breaks = seq(-2, 2, length.out = 100),
+  color = colorRampPalette(c("#7c9d97", "#F0F0F0", "#e9b383"))(100)
+)
+# dev.off()
+```
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+
+# Step 8: Scatter plot of ARG24 score vs. Selinexor IC50
+mat <- data.frame(
+  Cell_Line = row.names(rjaml_pcr),
+  risk_score = rjaml_pcr$ARG24,
+  Selinexor_IC50 = ic50$IC50
+)
+
+p1 <- ggscatter(
+  data = mat,
+  x = "risk_score",
+  y = "Selinexor_IC50",
+  color = "Selinexor_IC50",
+  alpha = 0.5,
+  add = "reg.line",
+  add.params = list(color = "#666666", fill = "lightgray"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.sep = "\n")
+) +
+  geom_text(aes(label = Cell_Line), hjust = 0.5, vjust = -1, size = 3, color = "black") +
+  theme_bw() +
+  labs(x = "ARG24 Score", y = "IC50 (Selinexor)") +
+  scale_color_gradient(low = "#FEE0D2", high = "#67000D")
+
+p1
+
+# Save to file
+# ggsave(p1, filename = "../03.out/figure6/12.risk_score_AML_selinexor_IC50.pdf", width = 5.1, height = 3.8)
+```
+
+## ssGSEA
+
+```{r}
+library(tidyverse)
+library(GSVA)
+library(GSEABase)
+library(dplyr)
+library(tibble)
+
+# Read data and preprocess
+mat <- read.csv("../03.out/figure6/fpmtb_132_tpm.csv", header = TRUE, row.names = 1, check.names = FALSE)
+
+# Step-by-step safe transformation
+mat_processed <- mat %>%
+  rownames_to_column("GeneID") %>%
+  as_tibble() %>%
+  mutate(
+    avg_expr = rowMeans(across(-c(GeneID, Symbol, Type)), na.rm = TRUE)
+  ) %>%
+  arrange(desc(avg_expr)) %>%
+  distinct(Symbol, .keep_all = TRUE) %>%
+  column_to_rownames("Symbol") %>%
+  dplyr::select(-GeneID, -Type, -avg_expr)
+
+# Log2 transform (add pseudocount to avoid -Inf)
+mat_log <- log2(mat_processed + 1)
+
+# Read gene sets
+gene.set <- getGmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Set matrixStats options to avoid warning
+options(matrixStats.useNames = TRUE) 
+
+# Run GSVA with proper parameters
+mat_log <- as.matrix(mat_log)
+gsvapar <- gsvaParam(mat_log, gene.set, maxDiff=TRUE)
+gsva_es <- gsva(gsvapar)
+gsva_es <- data.frame(t(gsva_es))
+
+gsva_es <- gsva_es[order(gsva_es$Integrated), ]
+top_33 <- rownames(head(gsva_es, 33))
+bot_33 <- rownames(tail(gsva_es, 33))
+samples <- c(top_33, bot_33)
+
+tpm <- read.csv("../03.out/figure6/fpmtb_132_tpm.csv", header = TRUE, row.names = 1, check.names = FALSE)
+count <- read.csv("../03.out/figure6/fpmtb_132_count.csv", header = TRUE, row.names = 1, check.names = FALSE)
+
+tpm <- tpm %>% rownames_to_column("ID")
+tpm <- tpm[, c("ID", "Symbol", "Type", samples)]
+count <- count[, samples]
+
+write.csv(tpm, "../03.out/figure6/fpmtb_top_bottom_25_tpm.csv")
+write.csv(count, "../03.out/figure6/fpmtb_top_bottom_25_count.csv")
+# Save results
+write.csv(gsva_es, "../03.out/figure6/gsva_nuclear_export_pathways_results.csv")
+```
+
+## DE analysis in FPMTB cohot
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+## run DESEQ2
+source("../01.script/RunDESeq2.R")
+
+tpm <- read.csv("../03.out/figure6/fpmtb_top_bottom_25_tpm.csv", header=T, row.names = 1)
+
+tpm <- subset(tpm, Type %in% c("protein_coding", "miRNA", "lincRNA", "antisense",
+                               "processed_transcript",
+                               "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+                               "transcribed_unprocessed_pseudogene","macro_lncRNA", "TEC",
+                               "3prime_overlapping_ncRNA","sense_intronic", "sense_overlapping",
+                               "unprocessed_pseudogene"))
+
+# filter low-express genes
+tpm <- tpm[rowMeans(tpm[, 4:ncol(tpm)]) >= 0.25, ]
+
+count <- read.csv("../03.out/figure6/fpmtb_top_bottom_25_count.csv", header=T, row.names = 1)
+count <- count[tpm$ID, ]
+
+RunDESeq2(count_mat = count, n.cont = 33, n.treat = 33,
+          prefix = "../03.out/figure6/DESeq2_arg24_high_low_fpmtb", sort.p = FALSE,
+          merge.normalized = TRUE,
+          normalized_mat = tpm)
+
+```
+
+## ARG24-high vs. ARG24-low (FPMTB)
+
+```{r}
+library(clusterProfiler)
+library(fgsea)
+library(enrichplot)
+library(dplyr)
+library(tidyverse)
+
+degene_mat <- read.table("../03.out/figure6/DESeq2_arg24_high_low_fpmtb_with_normalized_mat.txt", header = TRUE)
+
+# Prepare ranked gene list for GSEA
+DE_list <- degene_mat %>%
+  dplyr::select(ID = 9, Corr = 3) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  drop_na() %>%
+  mutate(rank = rank(Corr, ties.method = "random"))
+
+geneList <- DE_list$Corr
+names(geneList) <- DE_list$ID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# Load gene sets
+genesets <- read.gmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Convert TERM2GENE to a list
+gene_sets_list <- split(genesets$gene, genesets$term)
+
+# Run standard fgsea 
+fgsea.res <- fgsea(
+  pathways = gene_sets_list,
+  stats = geneList,
+  minSize = 1,
+  maxSize = 1200,
+  nperm = 100000
+)
+
+fgsea.res
+
+pdf("../03.out/figure6/GOBP_NUCLEAR_EXPORT_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_NUCLEAR_EXPORT"]], geneList) +
+  ggtitle("Enrichment of GOBP_NUCLEAR_EXPORT")
+dev.off()
+
+pdf("../03.out/figure6/GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT"]], geneList) +
+  ggtitle("Enrichment of GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT")
+dev.off()
+
+pdf("../03.out/figure6/GOBP_MRNA_TRANSPORT_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_MRNA_TRANSPORT"]], geneList) +
+  ggtitle("Enrichment of GOBP_MRNA_TRANSPORT")
+dev.off()
+
+```
+
+## Valcanoplot (FPMTB)
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(ggrastr)
+
+# Load data
+diff <- read.table("../03.out/figure6/DESeq2_arg24_high_low_fpmtb_with_normalized_mat.txt", header = TRUE)
+
+# Cap log2FoldChange to [-4, 4] and padj to [1e-6, 1]
+diff <- diff %>%
+  mutate(
+    log2FoldChange = case_when(
+      log2FoldChange > 4 ~ 4,
+      log2FoldChange < -4 ~ -4,
+      TRUE ~ log2FoldChange
+    ),
+    padj = case_when(
+      padj < 1e-6 ~ 1e-6,
+      TRUE ~ padj
+    )
+  )
+
+# Classify genes based on log2FoldChange and adjusted p-value
+diff <- diff %>%
+  mutate(g = case_when(
+    log2FoldChange > 0.5 & padj < 0.05 ~ "up",
+    log2FoldChange < -0.5 & padj < 0.05 ~ "down",
+    TRUE ~ "stable"
+  ))
+
+# Extract significantly upregulated and downregulated genes
+diff_up <- diff %>% filter(g == "up")
+diff_down <- diff %>% filter(g == "down")
+
+# Load gene sets
+genesets <- read.gmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Extract GOBP_NUCLEAR_EXPORT and GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT gene symbols
+GOBP_NUCLEAR_EXPORT <- genesets %>% filter(term == "GOBP_NUCLEAR_EXPORT") %>% pull(gene)
+GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT <- genesets %>% filter(term == "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT") %>% pull(gene)
+
+# Classify genes in the differential expression dataset
+diff <- diff %>%
+  mutate(gene_col = case_when(
+    Symbol %in% GOBP_NUCLEAR_EXPORT ~ "GOBP_NUCLEAR_EXPORT",
+    Symbol %in% GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT ~ "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT",
+    TRUE ~ "all"
+  ))
+
+# Prepare data subsets
+data_bg <- diff %>% filter(gene_col == "all")
+data_geneset <- diff %>% filter(grepl("GOBP_", gene_col))
+data_GOBP_NUCLEAR_EXPORT <- diff %>% filter(gene_col == "GOBP_NUCLEAR_EXPORT")
+data_GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT <- diff %>% filter(gene_col == "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT")
+
+# Define the base plot
+p <- ggplot(diff, aes(x = log2FoldChange, y = -log10(padj))) +
+  # Add shaded regions for significant up- and down-regulated genes
+  annotate(
+    geom = "rect", fill = "#ea838e", alpha = 0.3,
+    xmin = min(diff_up$log2FoldChange), xmax = max(diff_up$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  annotate(
+    geom = "rect", fill = "#827fd6", alpha = 0.3,
+    xmin = min(diff_down$log2FoldChange), xmax = max(diff_down$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  # Plot background points
+  geom_point_rast(
+    data = data_bg, shape = 21, color = "black", alpha = 0.2,
+    size = 1.3, stroke = 0.6
+  ) +
+  # Plot gene set and key points
+  geom_point_rast(
+    data = data_geneset,
+    aes(fill = gene_col), shape = 21, color = "black",
+    size = 2, stroke = 0.8
+  ) +
+  # Custom fill colors for gene sets and key genes
+  scale_fill_manual(
+    values = c(
+      "GOBP_NUCLEAR_EXPORT" = "#C98B88",
+      "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT" = "#6EB9C3"
+    )
+  ) +
+  # Add reference lines
+  geom_vline(xintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(yintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(
+    yintercept = -log10(0.05), color = "#ff7d82",
+    linewidth = 0.6, linetype = "dotted"
+  ) +
+  # Customize x-axis
+  scale_x_continuous(limits = c(-4, 4), breaks = seq(-4, 4, 1)) +
+  # Customize y-axis
+  scale_y_continuous(limits = c(-2, 7), breaks = seq(0, 6.5, 2), expand = c(0, 0)) +
+  # Apply classic theme and customize
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  ) +
+  # Customize axis labels
+  xlab("ARG24-High vs ARG24-Low") +
+  ylab("Significance (-log10 adj.p-val.)")
+
+# Add lineranges and annotations to the plot (p1)
+p1 <- p +
+  # Add lineranges for GOBP_NUCLEAR_EXPORT genes
+  geom_linerange(
+    data = data_GOBP_NUCLEAR_EXPORT,
+    aes(x = log2FoldChange, ymin = -1, ymax = -0.35),
+    color = "#C98B88", size = 0.5, linewidth = 0.1
+  ) +
+  # Add lineranges for GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT genes
+  geom_linerange(
+    data = data_GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT,
+    aes(x = log2FoldChange, ymin = -1.75, ymax = -1.1),
+    color = "#6EB9C3", size = 0.5, linewidth = 0.1
+  ) +
+  # Add text annotations for GOBP_NUCLEAR_EXPORT and GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT
+  annotate(
+    "text", x = -3, y = -0.7, label = "GOBP_NUCLEAR_EXPORT",
+    color = "#C98B88", size = 4.8, hjust = 0
+  ) +
+  annotate(
+    "text", x = -3, y = -1.4, label = "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT",
+    color = "#6EB9C3", size = 4.8, hjust = 0
+  ) +
+  # Add enrichment statistics for GOBP_NUCLEAR_EXPORT
+  annotate(
+    "text", x = 3.0, y = -0.7, label = "ES: 0.330\np.value = 0.008",
+    color = "#C98B88", size = 4.5, lineheight = 0.8, hjust = 1
+  ) +
+  # Add enrichment statistics for GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT
+  annotate(
+    "text", x = 3.0, y = -1.4, label = "ES: 0.296\np.value = 0.022",
+    color = "#6EB9C3", size = 4.5, lineheight = 0.8, hjust = 1
+  )
+
+p1
+ggsave(p1, filename = "../03.out/figure6/valcano_arg24_high_low_fpmtb.pdf", width = 6.5, height = 6.6)
+```
+
+```{r}
+# Subset TPM and count data to include only selected samples
+sample <- read.csv("../03.out/figure6/beataml_selected.csv", header = T)
+count <- read.csv("../03.out/figure6/beataml_400_count.csv", header = T, row.names = 1)
+tpm <- read.csv("../03.out/figure6/beataml_400_tpm.csv", header = T, row.names = 1)
+
+select_samples <- sample$X
+
+tpm <- tpm[, c("ID", "Symbol", "Type", select_samples)]
+count <- count[, select_samples]
+# 
+write.csv(count, "../03.out/figure6/beataml_top_bottom_25_count.csv")
+write.csv(tpm, "../03.out/figure6/beataml_top_bottom_25_tpm.csv")
+
+```
+
+## DE analysis in BeatAML cohot
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+## run DESEQ2
+source("../01.script/RunDESeq2.R")
+
+tpm <- read.csv("../03.out/figure6/beataml_top_bottom_25_tpm.csv", header=T, row.names = 1)
+
+tpm <- subset(tpm, Type %in% c("protein_coding", "miRNA", "lincRNA", "antisense",
+                               "processed_transcript",
+                               "transcribed_processed_pseudogene", "transcribed_unitary_pseudogene",
+                               "transcribed_unprocessed_pseudogene","macro_lncRNA", "TEC",
+                               "3prime_overlapping_ncRNA","sense_intronic", "sense_overlapping",
+                               "unprocessed_pseudogene"))
+
+# filter low-express genes
+tpm <- tpm[rowMeans(tpm[, 4:ncol(tpm)]) >= 0.25, ]
+
+count <- read.csv("../03.out/figure6/beataml_top_bottom_25_count.csv", header=T, row.names = 1)
+count <- count[tpm$ID, ]
+
+RunDESeq2(count_mat = count, n.cont = 100, n.treat = 100,
+          prefix = "../03.out/figure6/DESeq2_arg24_high_low_beataml", sort.p = FALSE,
+          merge.normalized = TRUE,
+          normalized_mat = tpm)
+
+```
+
+## ARG24-high vs. ARG24-low (BeatAML)
+
+```{r}
+library(clusterProfiler)
+library(fgsea)
+library(enrichplot)
+library(dplyr)
+
+degene_mat <- read.table("../03.out/figure6/DESeq2_arg24_high_low_beataml_with_normalized_mat.txt", header = TRUE)
+
+# Prepare ranked gene list for GSEA
+DE_list <- degene_mat %>%
+  dplyr::select(ID = 9, Corr = 3) %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  drop_na() %>%
+  mutate(rank = rank(Corr, ties.method = "random"))
+
+geneList <- DE_list$Corr
+names(geneList) <- DE_list$ID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# Load gene sets
+genesets <- read.gmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Convert TERM2GENE to a list
+gene_sets_list <- split(genesets$gene, genesets$term)
+
+# Run standard fgsea 
+fgsea.res <- fgsea(
+  pathways = gene_sets_list,
+  stats = geneList,
+  minSize = 1,
+  maxSize = 1200,
+  nperm = 100000
+)
+
+fgsea.res
+
+pdf("../03.out/figure6/beataml_GOBP_NUCLEAR_EXPORT_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_NUCLEAR_EXPORT"]], geneList) +
+  ggtitle("Enrichment of GOBP_NUCLEAR_EXPORT")
+dev.off()
+
+pdf("../03.out/figure6/beataml_GOMF_NUCLEAR_EXPORT_SIGNAL_RECEPTOR_ACTIVITY_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOMF_NUCLEAR_EXPORT_SIGNAL_RECEPTOR_ACTIVITY"]], geneList) +
+  ggtitle("Enrichment of GOMF_NUCLEAR_EXPORT_SIGNAL_RECEPTOR_ACTIVITY")
+dev.off()
+
+pdf("../03.out/figure6/beataml_GOBP_MRNA_TRANSPORT_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_MRNA_TRANSPORT"]], geneList) +
+  ggtitle("Enrichment of GOBP_MRNA_TRANSPORT")
+dev.off()
+
+pdf("../03.out/figure6/beataml_GOBP_NUCLEAR_RNA_SURVEILLANCE_gsea.pdf", width = 5, height = 2.5)
+plotEnrichment(gene_sets_list[["GOBP_NUCLEAR_RNA_SURVEILLANCE"]], geneList) +
+  ggtitle("Enrichment of GOBP_NUCLEAR_RNA_SURVEILLANCE")
+dev.off()
+
+```
+
+## Valcanoplot (BeatAML)
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(ggrastr)
+
+# Load data
+diff <- read.table("../03.out/figure6/DESeq2_arg24_high_low_beataml_with_normalized_mat.txt", header = TRUE)
+
+# Cap log2FoldChange to [-3, 3] and padj to [1e-12, 1]
+diff <- diff %>%
+  mutate(
+    log2FoldChange = case_when(
+      log2FoldChange > 3 ~ 3,
+      log2FoldChange < -3 ~ -3,
+      TRUE ~ log2FoldChange
+    ),
+    padj = case_when(
+      padj < 1e-12 ~ 1e-12,
+      TRUE ~ padj
+    )
+  )
+
+# Classify genes based on log2FoldChange and adjusted p-value
+diff <- diff %>%
+  mutate(g = case_when(
+    log2FoldChange > 0.5 & padj < 0.05 ~ "up",
+    log2FoldChange < -0.5 & padj < 0.05 ~ "down",
+    TRUE ~ "stable"
+  ))
+
+# Extract significantly upregulated and downregulated genes
+diff_up <- diff %>% filter(g == "up")
+diff_down <- diff %>% filter(g == "down")
+
+# Load gene sets
+genesets <- read.gmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Extract GOBP_NUCLEAR_EXPORT and GOBP_MRNA_TRANSPORT gene symbols
+GOBP_NUCLEAR_EXPORT <- genesets %>% filter(term == "GOBP_NUCLEAR_EXPORT") %>% pull(gene)
+GOBP_MRNA_TRANSPORT <- genesets %>% filter(term == "GOBP_MRNA_TRANSPORT") %>% pull(gene)
+
+# Classify genes in the differential expression dataset
+diff <- diff %>%
+  mutate(gene_col = case_when(
+    Symbol %in% GOBP_NUCLEAR_EXPORT ~ "GOBP_NUCLEAR_EXPORT",
+    Symbol %in% GOBP_MRNA_TRANSPORT ~ "GOBP_MRNA_TRANSPORT",
+    TRUE ~ "all"
+  ))
+
+# Prepare data subsets
+data_bg <- diff %>% filter(gene_col == "all")
+data_geneset <- diff %>% filter(grepl("GOBP_", gene_col))
+data_GOBP_NUCLEAR_EXPORT <- diff %>% filter(gene_col == "GOBP_NUCLEAR_EXPORT")
+data_GOBP_MRNA_TRANSPORT <- diff %>% filter(gene_col == "GOBP_MRNA_TRANSPORT")
+
+# Define the base plot
+p <- ggplot(diff, aes(x = log2FoldChange, y = -log10(padj))) +
+  # Add shaded regions for significant up- and down-regulated genes
+  annotate(
+    geom = "rect", fill = "#ea838e", alpha = 0.3,
+    xmin = min(diff_up$log2FoldChange), xmax = max(diff_up$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  annotate(
+    geom = "rect", fill = "#827fd6", alpha = 0.3,
+    xmin = min(diff_down$log2FoldChange), xmax = max(diff_down$log2FoldChange),
+    ymin = -log10(0.05), ymax = max(-log10(diff$padj))
+  ) +
+  # Plot background points
+  geom_point_rast(
+    data = data_bg, shape = 21, color = "black", alpha = 0.2,
+    size = 1.3, stroke = 0.6
+  ) +
+  # Plot gene set and key points
+  geom_point_rast(
+    data = data_geneset,
+    aes(fill = gene_col), shape = 21, color = "black",
+    size = 2, stroke = 0.8
+  ) +
+  # Custom fill colors for gene sets and key genes
+  scale_fill_manual(
+    values = c(
+      "GOBP_NUCLEAR_EXPORT" = "#C98B88",
+      "GOBP_MRNA_TRANSPORT" = "#6EB9C3"
+    )
+  ) +
+  # Add reference lines
+  geom_vline(xintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(yintercept = 0, color = "#b2b2b2", linewidth = 0.6) +
+  geom_hline(
+    yintercept = -log10(0.05), color = "#ff7d82",
+    linewidth = 0.6, linetype = "dotted"
+  ) +
+  # Customize x-axis
+  scale_x_continuous(limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  # Customize y-axis
+  scale_y_continuous(limits = c(-2, 14), breaks = seq(0, 14, 2), expand = c(0, 0)) +
+  # Apply classic theme and customize
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  ) +
+  # Customize axis labels
+  xlab("ARG24-High vs ARG24-Low") +
+  ylab("Significance (-log10 adj.p-val.)")
+
+# Add lineranges and annotations to the plot (p1)
+p1 <- p +
+  # Add lineranges for GOBP_NUCLEAR_EXPORT genes
+  geom_linerange(
+    data = data_GOBP_NUCLEAR_EXPORT,
+    aes(x = log2FoldChange, ymin = -1, ymax = -0.35),
+    color = "#C98B88", size = 0.5, linewidth = 0.1
+  ) +
+  # Add lineranges for GOBP_MRNA_TRANSPORT genes
+  geom_linerange(
+    data = data_GOBP_MRNA_TRANSPORT,
+    aes(x = log2FoldChange, ymin = -1.75, ymax = -1.1),
+    color = "#6EB9C3", size = 0.5, linewidth = 0.1
+  ) +
+  # Add text annotations for GOBP_NUCLEAR_EXPORT and GOBP_MRNA_TRANSPORT
+  annotate(
+    "text", x = -3, y = -0.7, label = "GOBP_NUCLEAR_EXPORT",
+    color = "#C98B88", size = 4.8, hjust = 0
+  ) +
+  annotate(
+    "text", x = -3, y = -1.4, label = "GOBP_MRNA_TRANSPORT",
+    color = "#6EB9C3", size = 4.8, hjust = 0
+  ) +
+  # Add enrichment statistics for GOBP_NUCLEAR_EXPORT
+  annotate(
+    "text", x = 3.0, y = -0.7, label = "ES: 0.261\np.value = 0.036",
+    color = "#C98B88", size = 4.5, lineheight = 0.8, hjust = 1
+  ) +
+  # Add enrichment statistics for GOBP_MRNA_TRANSPORT
+  annotate(
+    "text", x = 3.0, y = -1.4, label = "ES: 0.289\np.value = 0.021",
+    color = "#6EB9C3", size = 4.5, lineheight = 0.8, hjust = 1
+  )
+
+p1
+ggsave(p1, filename = "../03.out/figure6/valcano_arg24_high_low_beataml.pdf", width = 6.5, height = 6.6)
+```
+
+## Integration of DE out
+Differential expression analysis data were integrated by performing Fisher’s method through the metaseqR Bioconductor package
+
+```{r}
+library(tidyverse)
+library(metaseqR2)
+
+# Load data
+diff_fpmtb <- read.table("../03.out/figure6/DESeq2_arg24_high_low_fpmtb_with_normalized_mat.txt", 
+                         header = TRUE, stringsAsFactors = FALSE)
+diff_beataml <- read.table("../03.out/figure6/DESeq2_arg24_high_low_beataml_with_normalized_mat.txt", 
+                           header = TRUE, stringsAsFactors = FALSE)
+
+# Get common gene symbols
+common_genes <- intersect(diff_fpmtb$Symbol, diff_beataml$Symbol)
+
+# Clean and subset datasets
+prepare_diff_data <- function(df, dataset_label) {
+  df %>%
+    filter(Symbol %in% common_genes) %>%
+    distinct(Symbol, .keep_all = TRUE) %>%
+    select(Symbol, log2FoldChange, padj) %>%
+    rename_with(~ paste0(.x, "_", dataset_label), -Symbol)
+}
+
+diff_fpmtb_clean <- prepare_diff_data(diff_fpmtb, "fpmtb")
+diff_beataml_clean <- prepare_diff_data(diff_beataml, "beataml")
+
+# Merge datasets by Symbol and set row names
+merged_df <- inner_join(diff_fpmtb_clean, diff_beataml_clean, by = "Symbol") %>%
+  column_to_rownames("Symbol")
+
+# Now combine the adj.p-values using the Simes method
+pSimes <- apply(merged_df[, c("padj_fpmtb", "padj_beataml")], 1, combineSimes)
+merged_df$comb_padj <- pSimes
+merged_df$Symbol <- row.names(merged_df)
+
+```
+
+```{r}
+library(clusterProfiler)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+
+# Load gene sets
+genesets <- read.gmt("../03.out/figure6/NUCLEAR_EXPORT_Pathways.v2024.1.Hs.gmt")
+
+# Select specific pathways and extract unique gene symbols
+selected_terms <- c("GOBP_NUCLEAR_EXPORT", 
+                    "GOBP_REGULATION_OF_NUCLEOCYTOPLASMIC_TRANSPORT",
+                    "GOBP_MRNA_TRANSPORT")
+
+genesets_genes <- genesets %>% 
+  filter(term %in% selected_terms) %>%
+  distinct(gene) %>%
+  pull(gene)
+
+# Filter significantly differentially expressed genes in selected gene sets
+df_filtered <- merged_df %>%
+  filter(comb_padj < 0.05, Symbol %in% genesets_genes) %>%
+  mutate(across(c(log2FoldChange_fpmtb, log2FoldChange_beataml),
+                ~pmin(pmax(., -0.8), 0.8)))  # Cap values at ±0.8
+
+# Inspect resulting dataframe
+head(df_filtered)
+
+# Define quadrant group
+df_filtered <- df_filtered %>%
+  mutate(
+    quadrant = case_when(
+      log2FoldChange_fpmtb >= 0 & log2FoldChange_beataml >= 0 ~ "Q1: Up in both",
+      log2FoldChange_fpmtb < 0 & log2FoldChange_beataml >= 0  ~ "Q2: Down in fpmtb, Up in beatAML",
+      log2FoldChange_fpmtb < 0 & log2FoldChange_beataml < 0   ~ "Q3: Down in both",
+      log2FoldChange_fpmtb >= 0 & log2FoldChange_beataml < 0  ~ "Q4: Up in fpmtb, Down in beatAML"
+    )
+  )
+
+# Plot
+p <- ggplot(df_filtered, aes(x = log2FoldChange_fpmtb, y = log2FoldChange_beataml)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(size = -log10(comb_padj), fill = quadrant), shape = 21, stroke = 0.2, color = "black") +
+  geom_text_repel(
+    data = filter(df_filtered, quadrant == "Q1: Up in both"),
+    aes(label = Symbol),
+    size = 3,
+    box.padding = 0.3,
+    max.overlaps = Inf
+  ) +
+  scale_fill_manual(values = c(
+    "Q1: Up in both" = "#D078A7",
+    "Q2: Down in fpmtb, Up in beatAML" = "#00976A",
+    "Q3: Down in both" = "#006CAF",
+    "Q4: Up in fpmtb, Down in beatAML" = "#A09D9B"
+  )) +
+  scale_size_continuous(name = expression(-log[10](padj))) +
+  theme_classic() +
+  labs(
+    x = "log2FC in FPMTB cohort",
+    y = "log2FC in BeatAML cohort",
+    fill = "Quadrant"
+  )
+p
+
+ggsave(p, filename = "../03.out/figure6/dot_plots_two_cohorts.pdf", width = 7.2, height = 4.8)
+
+```
+

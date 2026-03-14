@@ -1,0 +1,1128 @@
+# Figure 3: Validation of the ARG24 Signature
+
+To independently validate the association of the ARG24 score with patient response to chemotherapy at diagnosis, we integrated the transcriptomic and clinical data from six cohorts across different analysis platforms, consisting of 1,512 patients. The bulk RNA-seq cohorts (BeatAML, Leucegene, TCVGH, GSE165656 and GSE146173) and microarray cohort (HOVON). We calculated the ARG24 scores using each patients' expression profiles. 
+
+## ARG24 Score Validation in Bulk RNA-Seq Cohorts
+
+```{r fig3_bulk_validation, eval=TRUE, message=FALSE, warning=FALSE}
+library(pROC)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+
+# Load validation dataset
+bulk_data <- read.csv("../02.data/24-Gene_MultiCohorts_riskScore.csv", header = TRUE)
+bulk_data <- subset(bulk_data, center != "RJAML")
+bulk_data$center <- factor(bulk_data$center, levels = c("BeatAML", "Leucegene", "TCVGH", "GSE165656", "GSE146173", "HOVON"))
+
+# Plot violin + box + raster
+p <- ggplot(bulk_data, aes(x = group, y = risk_score, color = group)) + 
+  geom_violin() +
+  geom_boxplot_jitter(width = 0.4, alpha = 0.75) + 
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  facet_wrap(. ~ center, ncol = 3, scales = 'free') + 
+  theme_pubr() + 
+  xlab("") + ylab("ARG24 Score") +
+  stat_compare_means(comparisons = list(c("CR", "NCR")), method = "wilcox.test") + 
+  scale_color_manual(values = c("#4292C6", "#A50F15")) +
+  theme(strip.text.x = element_text(size = 13), legend.position = "none")
+p
+
+# ggsave("../03.out/figure3/01.bulk_violin.pdf", p, width = 10, height = 4.2)
+
+## validation datasets
+data <- bulk_data[, 1:4]
+beat_dat <- subset(data, center == "BeatAML")
+leu_dat <- subset(data, center == "Leucegene")
+gse146173_dat <- subset(data, center == "GSE146173")
+tcv_dat <- subset(data, center == "TCVGH")
+gse165656_dat <- subset(data, center == "GSE165656")
+hovon_dat <- subset(data, center == "HOVON")
+
+auc3 <- auc(beat_dat$group, beat_dat$risk_score)
+roc3 <- roc(beat_dat$group, beat_dat$risk_score)
+auc4 <- auc(leu_dat$group, leu_dat$risk_score)
+roc4 <- roc(leu_dat$group, leu_dat$risk_score)
+auc5 <- auc(tcv_dat$group, tcv_dat$risk_score)
+roc5 <- roc(tcv_dat$group, tcv_dat$risk_score)
+auc6 <- auc(gse165656_dat$group, gse165656_dat$risk_score)
+roc6 <- roc(gse165656_dat$group, gse165656_dat$risk_score)
+auc7 <- auc(gse146173_dat$group, gse146173_dat$risk_score)
+roc7 <- roc(gse146173_dat$group, gse146173_dat$risk_score)
+auc8 <- auc(hovon_dat$group, hovon_dat$risk_score)
+roc8 <- roc(hovon_dat$group, hovon_dat$risk_score)
+
+plot(smooth(roc3),  col=brewer.pal(8, "Dark2")[1])
+plot(smooth(roc4), add=TRUE, col=brewer.pal(8, "Dark2")[2])
+plot(smooth(roc5), add=TRUE, col=brewer.pal(8, "Dark2")[3])
+plot(smooth(roc6), add=TRUE, col=brewer.pal(8, "Dark2")[4])
+plot(smooth(roc7), add=TRUE, col=brewer.pal(8, "Dark2")[5])
+plot(smooth(roc8), add=TRUE, col=brewer.pal(8, "Dark2")[6])
+legend("bottomright", 
+       legend = c(paste0("BeatAML AUC=", round(auc3, 3)),
+                  paste0("Leucegene AUC=", round(auc4, 3)),
+                  paste0("TCVGH AUC=", round(auc5, 3)),
+                  paste0("GSE165656 AUC=", round(auc6, 3)),
+                  paste0("GSE146173 AUC=", round(auc7, 3)),
+                  paste0("HOVON AUC=", round(auc8, 3))),
+       col = c(brewer.pal(8, "Dark2")[1:6]),
+       lty = 1)
+title(main = "Validation datasets")
+```
+
+## Integrate single cell datasets
+
+```{r}
+# ==============================================
+# AML Single-Cell Data Integration Pipeline
+# Description: Subsets and merges multiple AML scRNA-seq datasets
+# ==============================================
+
+library(Seurat)
+library(dplyr)
+library(future)
+library(purrr) 
+
+# Enable parallel processing if needed
+plan("multicore", workers = 8)
+options(future.globals.maxSize = 8000 * 1024^2) # 8GB
+
+# ======================
+# Data Loading Functions
+# ======================
+
+load_and_subset <- function(path, target_samples, id_col = "orig.ident") {
+  #' Load and subset Seurat object
+  #'
+  #' @param path Path to RDS file
+  #' @param target_samples Vector of sample IDs to keep
+  #' @param id_col Column containing sample IDs
+  #' @return Subsetted Seurat object
+  
+  message("\nLoading: ", basename(path))
+  obj <- tryCatch(
+    {
+      sobj <- readRDS(path)
+      
+      # Handle special cases for orig.ident
+      if (grepl("GSE227903", path)) {
+        sobj$orig.ident <- sobj$Sample
+      } else if (grepl("GSE239721", path)) {
+        sobj$orig.ident <- paste(sobj$patient, sobj$day, sep = "_")
+      }
+      
+      # Subset the object
+      cells_keep <- colnames(sobj)[sobj[[id_col]][[1]] %in% target_samples]
+      if (length(cells_keep) == 0) {
+        stop("No cells matched the target samples")
+      }
+      
+      subset(sobj, cells = cells_keep)
+    },
+    error = function(e) {
+      message("Error processing ", path, ": ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (!is.null(obj)) {
+    message("Retained ", ncol(obj), " cells from ", 
+            length(unique(obj$orig.ident)), " samples")
+  }
+  
+  return(obj)
+}
+
+# ====================
+# Dataset Configuration
+# ====================
+
+dataset_config <- list(
+  "GSE116256" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/scAML_GSE116256_30712Cells.rds",
+    samples = c("AML314-D0", "AML329-D0", "AML371-D0", "AML420B-D0", "AML722B-D0",
+                "AML475-D0", "AML556-D0", "AML707B-D0", "AML870-D0", "AML997-D0")
+  ),
+  "GSE185991" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/scAML_GSE185991_86446Cells.rds",
+    samples = c("PT01_DX", "PT02_DX", "PT06_DX", "PT07_DX", "PT08_DX",
+                "PT09_DX", "PT10_DX", "PT11_DX", "PT12_DX", "PT13_DX",
+                "PT15_DX", "PT17_DX", "PT18_DX")
+  ),
+  "GSE227903" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/scAML_GSE227903_111333Cells.rds",
+    samples = c("1216_Diagnosis", "1886_Diagnosis", "3822_Diagnosis", "3853_Diagnosis", 
+                "3904_Diagnosis", "40389_Diagnosis", "4978_Diagnosis", "5143_Diagnosis",
+                "5750_Diagnosis", "6323_Diagnosis")
+  ),
+  "GSE239721" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/GSE239721_101767Cells.rds",
+    samples = c("A.2_d0", "A.3_d0", "A.4_d0", "A.5_d0", "A.6_d0", "A.7_d0",
+                "A.8_d0", "A.9_d0", "A.10_d0", "A.11_d0", "A.12_d0", "A.13_d0",
+                "A.14_d0", "A.15_d0", "B.2_d0", "B.4_d0")
+  ),
+  "GSE241989" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/scAML_GSE241989_103690Cells.rds",
+    samples = c("03H112", "06H088", "09H010", "09H032",
+                "05H034", "05H066", "07H134", "14H007")
+  ),
+  "GSE272758" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/jp_projects/neoantigen/rjaml_7samples_61902_cells.rds",
+    samples = c("R0132", "R0133", "R0134", "R0135")
+  ),
+  "GSE240618" = list(
+    path = "/dssg/home/acct-medljm/medljm-jqq/projects/AML_plasticity/jp_2024/scAML_GSE240618.rds",
+    samples = c("AML1",	"AML2",	"AML3",	"AML4",	"AML5",	"AML6",	"AML7",	"AML8",	"AML9",	"AML10", "AML11",	
+                "AML12",	"AML13",	"AML14",	"AML15",	"AML16",	"AML17",	"AML18", "AML19",	"AML20") 
+  )
+)
+
+# ====================
+# Data Processing
+# ====================
+
+# Load and subset all datasets
+seurat_list <- lapply(names(dataset_config), function(dataset) {
+  config <- dataset_config[[dataset]]
+  if (!is.null(config$samples)) {
+    load_and_subset(config$path, config$samples)
+  } else {
+    readRDS(config$path)
+  }
+}) %>% 
+  setNames(names(dataset_config)) %>% 
+  compact() # Remove NULL elements
+
+# =============
+# Data Merging
+# =============
+
+# Add dataset origin metadata
+for (dataset in names(seurat_list)) {
+  seurat_list[[dataset]]$Dataset <- dataset
+}
+
+# Merge all datasets
+message("\nMerging datasets...")
+merged_aml <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = names(seurat_list),
+  project = "AML_Merged"
+)
+
+# Clean up metadata
+merged_aml$orig.ident <- factor(merged_aml$orig.ident)
+merged_aml$Dataset <- factor(merged_aml$Dataset)
+
+# Create a named vector of response status
+response_data <- c(
+  # GSE116256 samples
+  "AML314-D0" = "CR", "AML329-D0" = "CR", "AML371-D0" = "CR", 
+  "AML420B-D0" = "CR", "AML475-D0" = "CR", "AML556-D0" = "CR",
+  "AML707B-D0" = "NCR", "AML870-D0" = "CR", "AML997-D0" = "CR",
+  "AML722B-D0" = "CR",
+  
+  # GSE185991 samples
+  "PT01_DX" = "NCR", "PT02_DX" = "NCR", "PT06_DX" = "CR",
+  "PT07_DX" = "CR", "PT08_DX" = "CR", "PT09_DX" = "CR",
+  "PT10_DX" = "CR", "PT11_DX" = "NCR", "PT12_DX" = "CR",
+  "PT13_DX" = "NCR", "PT15_DX" = "CR", "PT17_DX" = "NCR", 
+  "PT18_DX" = "CR",
+  
+  # GSE227903 samples
+  "1216_Diagnosis" = "CR", "1886_Diagnosis" = "CR",
+  "3822_Diagnosis" = "CR", "3853_Diagnosis" = "CR",
+  "3904_Diagnosis" = "CR", "40389_Diagnosis" = "CR",
+  "4978_Diagnosis" = "CR", "5143_Diagnosis" = "CR",
+  "5750_Diagnosis" = "CR", "6323_Diagnosis" = "CR",
+  
+  # GSE239721 samples
+  "A.2_d0" = "NCR", "A.3_d0" = "NCR", "A.4_d0" = "NCR",
+  "A.5_d0" = "NCR", "A.6_d0" = "CR", "A.7_d0" = "CR",
+  "A.8_d0" = "NCR", "A.9_d0" = "CR", "A.10_d0" = "CR",
+  "A.11_d0" = "CR", "A.12_d0" = "CR", "A.13_d0" = "CR",
+  "A.14_d0" = "NCR", "A.15_d0" = "NCR", "B.2_d0" = "NCR", 
+  "B.4_d0" = "CR",
+  
+  # GSE241989 samples
+  "03H112" = "CR", "06H088" = "CR", "09H010" = "CR",
+  "09H032" = "CR", "05H034" = "NCR", "05H066" = "NCR",
+  "07H134" = "NCR", "14H007" = "NCR",
+  
+  # GSE272758 samples
+  "R0132" = "CR", "R0133" = "CR", "R0134" = "CR", 
+  "R0135" = "NCR",
+  
+  # GSE240618 samples
+  "AML1" = "NCR", "AML2" = "NCR", "AML3" = "NCR",
+  "AML4" = "NCR", "AML5" = "NCR", "AML6" = "CR",
+  "AML7" = "CR", "AML8" = "CR", "AML9" = "CR",
+  "AML10" = "CR", "AML11" = "CR", "AML12" = "CR",
+  "AML13" = "CR", "AML14" = "CR", "AML15" = "CR",
+  "AML16" = "CR", "AML17" = "CR", "AML18" = "CR",
+  "AML19" = "CR", "AML20" = "CR"
+)
+
+# Convert to data frame
+response_df <- data.frame(
+  orig.ident = names(response_data),
+  Response = unname(response_data),
+  row.names = NULL
+)
+
+# Create response vector with proper names
+response_vec <- setNames(response_df$Response, response_df$orig.ident)
+
+# Check coverage
+coverage <- mean(unique(merged_aml$orig.ident) %in% names(response_vec))
+message(sprintf("Response data covers %.1f%% of samples", coverage*100))
+
+# Direct assignment (most reliable)
+merged_aml$Response <- ifelse(
+  merged_aml$orig.ident %in% names(response_vec),
+  response_vec[as.character(merged_aml$orig.ident)],
+  "Unknown"  # Default for unmatched samples
+)
+
+merged_aml@meta.data <- merged_aml@meta.data[, c("orig.ident", "nCount_RNA", "nFeature_RNA", "percent.mt", "Dataset", "Response")]
+
+# =============
+# Quality Report
+# =============
+
+message("\nFinal merged object summary:")
+print(merged_aml)
+message("\nCell counts by dataset:")
+print(table(merged_aml$Dataset))
+message("\nCell counts by sample:")
+print(table(merged_aml$orig.ident))
+
+# =============
+# Save Results
+# =============
+
+output_path <- "/dssg/home/acct-medljm/medljm-jqq/projects/jp_projects/chemoSig/02.data/merged_scaml_response.rds"
+saveRDS(merged_aml, file = output_path)
+message("\nSaved merged object to: ", output_path)
+
+```
+
+### Single-cell RNA-seq Reference Mapping
+
+```{r fig3_scrna_refmap, eval=TRUE, message=FALSE, warning=FALSE}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(BoneMarrowMap)
+
+# Load Symphony reference
+ref <- readRDS("../02.data/BM_reference/BoneMarrow_RefMap_SymphonyRef.rds")
+# Set uwot path for UMAP projection
+ref$save_uwot_path <- "../02.data/BM_reference/BoneMarrow_RefMap_uwot_model.uwot"
+
+# Visualize Bone Marrow reference
+ReferenceSeuratObj <- create_ReferenceObject(ref)
+
+###########################################################
+# Map Query data and evaluate mapping QC metrics (< 1min) #
+###########################################################
+query <- readRDS("../02.data/merged_scaml_response.rds")
+
+# batch variable to correct in the query data, set as NULL if no batches in query
+batchvar <- 'orig.ident'
+
+# Map query dataset using Symphony (Kang et al 2021)
+query <- map_Query(
+    exp_query = query[['RNA']]@counts, 
+    metadata_query = query@meta.data,
+    ref_obj = ref,
+    vars = batchvar
+)
+
+# Run QC based on mapping error score, flag cells with mapping error >= 2.5 MADs above median
+query <- query %>% calculate_MappingError(., reference = ref, MAD_threshold = 2.5, 
+                                          threshold_by_donor = TRUE, donor_key = batchvar)
+
+QC_plots <- plot_MappingErrorQC(query)
+
+# Plot together - If this is too crowded, can also just call "QC_plots" aloneto display one by one
+p <- patchwork::wrap_plots(QC_plots, ncol = 4, widths = c(0.8, 0.3, 0.8, 0.3))
+
+# Predict Hematopoietic Cell Types by KNN classification
+query <- predict_CellTypes(
+  query_obj = query, 
+  ref_obj = ref, 
+  initial_label = 'initial_CellType', # celltype assignments before filtering on mapping QC
+  final_label = 'predicted_CellType'  # celltype assignments with map QC failing cells assigned as NA
+) 
+
+# Broad cell type mapping 
+celltype_mapping <- c(
+  "HSC" = "HSC MPP",
+  "MPP-MkEry" = "HSC MPP",
+  "MPP-MyLy" = "HSC MPP",
+  "MEP" = "MEP",
+  "BFU-E" = "MEP",
+  "Megakaryocyte Precursor" = "Megakaryocyte Precursor",
+  "Megakaryocyte" = "Megakaryocyte Precursor",
+  "EoBasoMast Precursor" = "EoBasoMast Precursor",
+  "CFU-E" = "Early Erythroid",
+  "Pro-Erythroblast" = "Early Erythroid",
+  "Basophilic Erythroblast" = "Early Erythroid",
+  "Orthochromatic Erythroblast" = "Late Erythroid",
+  "Polychromatic Erythroblast" = "Late Erythroid",
+  "LMPP" = "LMPP",
+  "Cycling Progenitor" = "Cycling Progenitor",
+  "Early GMP" = "Early GMP",
+  "GMP-Cycle" = "Late GMP",
+  "GMP-Neut" = "Late GMP",
+  "GMP-Mono" = "Late GMP",
+  "Early ProMono" = "Pro-Monocyte",
+  "Late ProMono" = "Pro-Monocyte",
+  "CD14 Mono" = "Monocyte",
+  "CD16 Mono" = "Monocyte",
+  "Pre-cDC" = "cDC",
+  "cDC2" = "cDC",
+  "cDC1" = "cDC",
+  "ASDC" = "cDC",
+  "MLP" = "Early Lymphoid",
+  "CLP" = "Early Lymphoid",
+  "Pre-ProB" = "Early Lymphoid",
+  "MLP-II" = "Early Lymphoid",
+  "Pre-pDC" = "pDC",
+  "Pre-pDC Cycling" = "pDC",
+  "pDC" = "pDC",
+  "Pro-B VDJ" = "Pro-B",
+  "Pro-B Cycling" = "Pro-B",
+  "Large Pre-B" = "Pre-B",
+  "Small Pre-B" = "Pre-B",
+  "Immature B" = "B",
+  "Mature B" = "B",
+  "CD4 Naive" = "Naïve T",
+  "CD8 Naive" = "Naïve T",
+  "CD4 Regulatory" = "CD4 Memory T",
+  "CD4 Central Memory" = "CD4 Memory T",
+  "CD4 Effector Memory" = "CD4 Memory T",
+  "CD8 Effector Memory 1" = "CD8 Memory T",
+  "CD8 Effector Memory 2" = "CD8 Memory T",
+  "CD8 Central Memory" = "CD8 Memory T",
+  "CD8 Tissue Resident Memory" = "CD8 Memory T",
+  "T Proliferating" = "CD8 Memory T",
+  "NK" = "NK",
+  "NK CD56high" = "NK",
+  "NK Proliferating" = "NK",
+  "Plasma Cell" = "Plasma Cell",
+  "Stromal" = "Stromal"
+)
+
+# Then add the new column to your metadata
+query@meta.data$predicted_CellType_Broad <- celltype_mapping[as.character(query@meta.data$predicted_CellType)]
+
+# Check if any NAs were introduced (for cell types not in your mapping)
+if (any(is.na(query@meta.data$predicted_CellType_Broad))) {
+  warning("Some cell types didn't have a mapping. They were assigned NA.")
+  print(table(query@meta.data$predicted_CellType[is.na(query@meta.data$predicted_CellType_Broad)]))
+}
+
+saveRDS(query, "../02.data/merged_scaml_response.rds")
+```
+
+### Single-cell Mapping
+
+```{r fig3_scrna_map_riskscore, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(Seurat)
+library(dplyr)
+
+scaml <- readRDS("../02.data/merged_scaml_response.rds")
+
+scaml <- NormalizeData(scaml, normalization.method = "LogNormalize")
+
+# Fail   Pass 
+# 12021 273910
+  
+# Color palette
+my36colors <- c('#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963', 
+                '#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658', 
+                '#9FA3A8', '#E0D4CA', '#5F3D69', '#58A4C3', "#b20000",'#E4C755', '#F7F398',
+                '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B','#968175')
+
+scaml.filter <- subset(scaml, mapping_error_QC == 'Pass')
+
+# DimPlot: AML cells projected onto reference map
+p1 <- DimPlot(scaml.filter, group.by = "predicted_CellType_Broad", cols = my36colors, 
+              label = FALSE, repel = TRUE, raster = FALSE) 
+p2 <- DimPlot(scaml.filter, group.by = "predicted_CellType_Broad", cols = my36colors, 
+              split.by = "Response", label = FALSE, repel = TRUE, raster = FALSE) 
+
+# Save plots
+pdf("../03.out/figure3/02.AML_mapTo_refMap_cellClass.pdf", width = 7, height = 4.2)
+p1
+dev.off()
+
+pdf("../03.out/figure3/02.AML_mapTo_refMap_Response.pdf", width = 11, height = 4.2)
+p2
+dev.off()
+
+```
+
+### Pseudobulk scoring
+
+```{r fig3_scrna_pseudobulk_score, eval=TRUE, message=FALSE, warning=FALSE}
+# Process data
+
+library(Seurat)
+library(dplyr)
+library(Matrix)
+
+# 1. Load filtered data
+scaml <- readRDS("../02.data/merged_scaml_response.rds")
+scaml.filter <- subset(scaml, mapping_error_QC == 'Pass')
+
+# 2. Load gene signature
+gene.min <- read.csv("../02.data/24-gene_signature.csv", 
+                    header = TRUE, 
+                    row.names = 1, 
+                    check.names = FALSE) %>%
+  {.[rownames(.) %in% rownames(scaml.filter), , drop = FALSE]}
+
+# 3. Create pseudobulk matrix (unchanged)
+pseudobulk_creation <- function(seurat_obj, assay = "RNA", sample_col = "orig.ident") {
+  counts <- GetAssayData(seurat_obj, assay = assay, layer = "counts")
+  sample_list <- unique(seurat_obj@meta.data[[sample_col]])
+  pb_counts <- matrix(NA, nrow = nrow(counts), ncol = length(sample_list),
+                     dimnames = list(rownames(counts), sample_list))
+  
+  for (sample in sample_list) {
+    cells <- colnames(seurat_obj)[seurat_obj@meta.data[[sample_col]] == sample]
+    pb_counts[, sample] <- if(length(cells) > 1) rowSums(counts[, cells]) else counts[, cells]
+  }
+  
+  log2(edgeR::cpm(pb_counts) + 1)
+}
+
+pb_matrix <- pseudobulk_creation(scaml.filter)
+
+# 4. Calculate scores (unchanged)
+calculate_pb_score <- function(pb_matrix, lasso_coef) {
+  genes <- intersect(rownames(pb_matrix), rownames(lasso_coef))
+  colSums(pb_matrix[genes, ] * lasso_coef[genes, 1], na.rm = TRUE)
+}
+
+pb_scores <- calculate_pb_score(pb_matrix, gene.min)
+
+# 5. Create results with FIXED response mapping
+response_mapping <- scaml.filter@meta.data %>%
+  group_by(orig.ident) %>%
+  summarise(
+    Response = if("Response" %in% colnames(.)) Response[1] else NA_character_,
+    .groups = 'drop'
+  )
+
+pb_results <- data.frame(
+  sample = names(pb_scores),
+  ARG24_score = pb_scores,
+  n_cells = as.integer(table(scaml.filter@meta.data$orig.ident)[names(pb_scores)]),
+  row.names = NULL
+) %>%
+  left_join(response_mapping, by = c("sample" = "orig.ident")) %>%
+  dplyr::select(sample, Response, everything()) %>%
+  arrange(desc(ARG24_score))
+
+# 6. Save results
+write.csv(pb_results, "../02.data/pseudobulk_ARG24_scores.csv", row.names = FALSE)
+```
+
+```{r}
+# Visualize results
+
+library(pROC)
+library(ggpubr)
+library(dplyr)
+library(RColorBrewer)
+
+# 1. Load and prepare data
+pb_results <- read.csv("../02.data/pseudobulk_ARG24_scores.csv", header = TRUE) %>%
+  mutate(
+    Response = factor(Response, levels = c("CR", "NCR")), # Ensure consistent ordering
+    size_label = ifelse(n_cells > 10000, format(n_cells, big.mark = ","), NA) # Format large numbers
+  )
+
+# 2. ARG24 Score by Sample (Bar plot)
+p1 <- ggplot(pb_results, aes(x = reorder(sample, ARG24_score), y = ARG24_score)) +
+  geom_col(aes(fill = ARG24_score)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "ARG24 Score") +
+  labs(
+    x = "Sample",
+    y = "Pseudobulk ARG24 Score",
+    title = "ARG24 Score Distribution Across Samples"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+# 3. Response Comparison (Violin + Boxplot)
+p2 <- ggplot(pb_results, aes(x = Response, y = ARG24_score, color = Response)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.4, alpha = 0.75) + 
+  geom_jitter(aes(size = n_cells), width = 0.2, alpha = 0.7) +
+  theme_pubr() + 
+  xlab("") + ylab("ARG24 Score") +
+  stat_compare_means(comparisons = list(c("CR", "NCR")), method = "wilcox.test") +
+  scale_color_manual(values = c("#4292C6", "#A50F15")) +
+  theme(strip.text.x = element_text(size = 13), legend.position = "right")
+
+# 4. ROC Analysis
+
+roc_obj <- roc(pb_results$Response, pb_results$ARG24_score)
+
+pdf("../03.out/figure3/03.scrna_roc.pdf", width = 4.2, height = 4)
+plot(smooth(roc_obj), col = brewer.pal(8, "Dark2")[3])
+legend("bottomright", legend = paste0("AUC = ", round(auc(roc_obj), 3)), col = brewer.pal(8, "Dark2")[3], lty = 1)
+title(main = "Pseudobulk Validation (N = 81)")
+dev.off()
+
+# Save plots
+ggsave("../03.out/figure3/03.pseudobulk_barplot.pdf", p1, width = 10, height = 5)
+ggsave("../03.out/figure3/03.pseudobulk_violin.pdf", p2, width = 5.5, height = 5)
+
+```
+
+### Single-cell ARG24 score mapping
+
+```{r}
+library(Seurat)
+library(dplyr)
+
+scaml <- readRDS("../02.data/merged_scaml_response.rds")
+scaml.filter <- subset(scaml, mapping_error_QC == 'Pass')
+Idents(scaml.filter) <- scaml.filter$predicted_CellType_Broad
+
+# Set color palette
+my36colors <- c('#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658', 
+                '#9FA3A8', '#E0D4CA', '#5F3D69', '#58A4C3', "#b20000",'#E4C755', '#F7F398',
+                '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+                '#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963', '#968175')
+
+pdf("../03.out/figure3/05.scaml.filter_umap.pdf", width = 9, height = 4)
+DimPlot(scaml.filter, group.by = "predicted_CellType_Broad", label = TRUE, repel = TRUE, raster = FALSE, cols = my36colors)
+dev.off()
+
+# 1. Load 24-gene signature and filter to available genes
+gene.min <- read.csv("../02.data/24-gene_signature.csv", 
+                    header = TRUE, 
+                    row.names = 1, 
+                    check.names = FALSE) %>%
+  {.[rownames(.) %in% rownames(scaml.filter), , drop = FALSE]} # Keep only genes present in scaml
+
+# Check filtered genes
+message("Using ", nrow(gene.min), " of 24 genes:")
+print(rownames(gene.min))
+
+# 2. Updated risk score function (matrix-safe)
+risk_score <- function(data, lasso_coef) {
+  genes <- intersect(rownames(data), rownames(lasso_coef))
+  expr_matrix <- as.matrix(data[genes, ]) # Ensure matrix format
+  score_mat <- sweep(t(expr_matrix), 2, lasso_coef[genes, 1], `*`)
+  rowSums(score_mat, na.rm = TRUE)
+}
+
+# 3. Calculate scores using updated Seurat syntax
+scaml.filter@meta.data$sc_ARG24 <- risk_score(
+  GetAssayData(scaml.filter, assay = "RNA", layer = "data"),
+  gene.min
+)
+
+# 4. Verify results
+summary(scaml.filter@meta.data$sc_ARG24)
+
+# DotPlot plot for ARG24 score
+library(ggplot2)
+library(Seurat)
+library(patchwork)
+
+# Subset DotPlots
+p1_data <- DotPlot(subset(scaml.filter, Response == "CR"), features = "sc_ARG24")$data
+p2_data <- DotPlot(subset(scaml.filter, Response == "NCR"), features = "sc_ARG24")$data
+
+# Combine to get common limits
+all_data <- rbind(p1_data, p2_data)
+color_limits <- range(all_data$avg.exp.scaled, na.rm = TRUE)
+size_limits <- range(all_data$pct.exp, na.rm = TRUE)
+
+# Rebuild plots with unified scales
+p1 <- ggplot(p1_data, aes(x = features.plot, y = id)) +
+  geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+  scale_color_gradientn(colors = c("grey90", "blue"), limits = color_limits) +
+  scale_size(range = c(1, 8), limits = size_limits) +
+  theme_bw() +
+  labs(title = "CR", x = "sc_ARG24", y = "") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p2 <- ggplot(p2_data, aes(x = features.plot, y = id)) +
+  geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+  scale_color_gradientn(colors = c("grey90", "blue"), limits = color_limits) +
+  scale_size(range = c(1, 8), limits = size_limits) +
+  theme_bw() +
+  labs(title = "NCR", x = "sc_ARG24", y = "") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Combine
+plots <- p1 + p2 + plot_layout(guides = "collect")
+
+ggsave(plots, filename = "../03.out/figure3/dotplot_arg24_response.pdf", width = 6, height = 7.5)
+
+# Extract metadata
+meta <- scaml.filter@meta.data
+
+# 5. Summary and Wilcoxon p-values
+summary_stats <- meta %>%
+  group_by(predicted_CellType_Broad, Response) %>%
+  summarise(mean_score = mean(sc_ARG24, na.rm = TRUE), .groups = 'drop') %>%
+  tidyr::pivot_wider(names_from = Response, values_from = mean_score, names_prefix = "mean_") %>%
+  left_join(
+    meta %>%
+      group_by(predicted_CellType_Broad) %>%
+      summarise(p_val = wilcox.test(sc_ARG24 ~ Response)$p.value, .groups = 'drop'),
+    by = "predicted_CellType_Broad"
+  ) %>%
+  mutate(
+    signif = case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# 6. Cell counts and filtering
+cell_counts <- meta %>%
+  group_by(predicted_CellType_Broad, Response) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Response, values_from = n, values_fill = 0) %>%
+  mutate(total = CR + NCR)
+
+# write.csv(meta, "../02.data/scaml.filter_meta.csv")
+# write.csv(summary_stats, "../02.data/scaml.filter_summary_stats.csv")
+# write.csv(cell_counts, "../02.data/scaml.filter_cell_counts.csv")
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork) # For combining plots
+
+meta <- read.csv("../02.data/scaml.filter_meta.csv", header = T)
+summary_stats <- read.csv("../02.data/scaml.filter_summary_stats.csv", header = T)
+cell_counts <- read.csv("../02.data/scaml.filter_cell_counts.csv", header = T)
+
+# # Calculate filtering threshold (2‰ of total cells)
+# filter_threshold <- dim(meta)[1] * 0.002
+# 
+# # Keep only cell types with ≥20 cells in each group
+# valid_cells <- cell_counts %>%
+#   filter(total >= filter_threshold) %>%
+#   pull(predicted_CellType_Broad)
+
+# summary_stats <- summary_stats %>%
+#   filter(predicted_CellType_Broad %in% valid_cells)
+# cell_counts <- cell_counts %>%
+#   filter(predicted_CellType_Broad %in% valid_cells)
+
+# Create scatter plot
+scatter_plot <- ggplot(summary_stats, aes(x = mean_CR, y = mean_NCR)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "grey40", linewidth = 0.8, alpha = 0.7) +
+  # Points colored by significance and sized by p-value
+  geom_point(aes(size = -log10(p_val), 
+             color = "white", stroke = 0.3)) + # White outline for better visibility
+  geom_point(aes(size = -log10(p_val), color = signif), 
+             alpha = 0.8) +
+  # Text labels with improved formatting
+  geom_text_repel(aes(label = paste0(predicted_CellType_Broad, "\n", signif)),
+                  size = 3.2, 
+                  box.padding = 0.4,
+                  point.padding = 0.2,
+                  min.segment.length = 0.2,
+                  max.overlaps = Inf,
+                  segment.color = "grey70") +
+  # Size scale for p-values
+  scale_size_continuous(range = c(3, 8),
+                       breaks = c(20, 50, 100, 150),
+                       name = "-log10(p-value)") +
+  # Axis labels and title
+  labs(x = "Mean sc_ARG24 in CR cells",
+       y = "Mean sc_ARG24 in NCR cells",
+       title = "Comparison of sc_ARG24 Scores in CR vs NCR by Cell Type",
+       subtitle = "Diagonal line represents equal expression in both groups") +
+  # Theme improvements
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.spacing.y = unit(0.2, "cm"),
+    panel.grid.minor = element_blank(),
+    aspect.ratio = 1  # Make plot square
+  ) +
+  # Equal axis scaling
+  coord_fixed(ratio = 1) +
+  # Add a small margin around points
+  expand_limits(x = c(min(summary_stats$mean_CR, summary_stats$mean_NCR) * 0.95),
+                y = c(min(summary_stats$mean_CR, summary_stats$mean_NCR) * 0.95))
+
+scatter_plot
+
+ggsave(scatter_plot, filename = "../03.out/figure3/05.scaml_celltype_scatterplot.pdf", width = 7, height = 6.7)
+
+```
+
+## Cell Type Ratios Between CR and NCR Groups
+
+```{r fig3_celltype_ratios, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+library(ggrastr)
+library(RColorBrewer)
+library(dplyr)
+library(ggrepel)
+
+scaml <- readRDS("../02.data/merged_scaml_response.rds")
+scaml.filter <- subset(scaml, mapping_error_QC == 'Pass')
+
+# Set color palette
+my36colors <- c('#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658', 
+                '#9FA3A8', '#E0D4CA', '#5F3D69', '#58A4C3', "#b20000",'#E4C755', '#F7F398',
+                '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+                '#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963', '#968175')
+
+
+# Compute cell counts by type and response
+num_cells <- as.data.frame(table(scaml.filter$predicted_CellType_Broad, scaml.filter$Response))
+colnames(num_cells) <- c("Cell_type", "Response", "Number")
+
+# Barplot of cell counts
+p_count <- ggplot(num_cells, aes(x = reorder(Cell_type, -Number), y = Number, fill = Number)) +
+  geom_bar(stat = "identity") +
+  facet_grid(Response ~ .) +
+  theme_classic() +
+  labs(x = "Cell Type", y = "Cell Number (log scale)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  scale_y_log10()
+p_count
+ggsave(p_count, filename = "../03.out/figure3/04.cellType_counts.pdf", width = 8, height = 5)
+
+# Compute cell ratios by patient
+cellratio <- prop.table(table(scaml.filter$predicted_CellType_Broad, scaml.filter$orig.ident), margin = 2)
+cellratio <- data.frame(cellratio)
+colnames(cellratio) <- c("Cell_type", "orig.ident", "ratio")
+
+# Merge with patient metadata
+meta <- scaml.filter@meta.data
+
+sample <- meta[, c("orig.ident", "Response")]
+sample <- sample[!duplicated(sample), ]
+rownames(sample) <- 1:nrow(sample)
+
+cellratio <- merge(cellratio, sample, by = "orig.ident")
+
+# Calculate filtering threshold (2‰ of total cells)
+
+# filter_threshold <- dim(meta)[1] * 0.002
+# 
+# # Filter to major cell types (>=300 cells total)
+# total_cells <- as.data.frame(table(scaml.filter$predicted_CellType_Broad))
+# major_types <- total_cells$Var1[total_cells$Freq >= filter_threshold]
+# cellratio <- cellratio[cellratio$Cell_type %in% major_types, ]
+
+# Statistical comparison by cell type
+stats <- lapply(unique(cellratio$Cell_type), function(ct) {
+  tmp <- cellratio[cellratio$Cell_type == ct, ]
+  test <- wilcox.test(ratio ~ Response, data = tmp)
+  data.frame(
+    Cell_type = ct,
+    Ratio_CR = mean(tmp$ratio[tmp$Response == "CR"]),
+    Ratio_NCR = mean(tmp$ratio[tmp$Response == "NCR"]),
+    P.value = test$p.value
+  )
+}) %>% bind_rows()
+
+# Annotate significance
+stats <- stats %>%
+  mutate(
+    diff_abundance = Ratio_NCR - Ratio_CR,
+    log2fc = log2(Ratio_NCR / Ratio_CR),
+    p_label = case_when(
+      P.value < 0.001 ~ "***",
+      P.value < 0.01 ~ "**",
+      P.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    negLog10P = -log10(P.value)
+  ) %>%
+  arrange(desc(log2fc))
+
+stats$Cell_type <- factor(stats$Cell_type, levels = rev(stats$Cell_type))
+
+# Create scatter plot
+scatter_plot <- ggplot(stats, aes(x = Ratio_CR, y = Ratio_NCR)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "grey40", linewidth = 0.8, alpha = 0.7) +
+  # Points colored by significance and sized by p-value
+  geom_point(aes(size = -log10(P.value), 
+             color = "white", stroke = 0.3)) + # White outline for better visibility
+  geom_point(aes(size = -log10(P.value), color = p_label), 
+             alpha = 0.8) +
+  # Text labels with improved formatting
+  geom_text_repel(aes(label = paste0(Cell_type, "\n", p_label)),
+                  size = 3.2, 
+                  box.padding = 0.4,
+                  point.padding = 0.2,
+                  min.segment.length = 0.2,
+                  max.overlaps = Inf,
+                  segment.color = "grey70") +
+  # Axis labels and title
+  labs(x = "Mean cell ratio in CR group",
+       y = "Mean cell ratio in NCR group") +
+  # Theme improvements
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.spacing.y = unit(0.2, "cm"),
+    panel.grid.minor = element_blank(),
+    aspect.ratio = 1  # Make plot square
+  ) +
+  # Equal axis scaling
+  coord_fixed(ratio = 1) +
+  # Add a small margin around points
+  expand_limits(x = c(min(stats$Ratio_CR, stats$Ratio_NCR) * 0.95),
+                y = c(min(stats$Ratio_CR, stats$Ratio_NCR) * 0.95))
+
+scatter_plot
+
+ggsave(scatter_plot, filename = "../03.out/figure3/05.cellular_abundance.pdf", width = 7, height = 6.7)
+
+```
+
+## Cell Type Distribution Across Patients
+
+```{r fig3_celltype_bar_violin, eval=TRUE, message=FALSE, warning=FALSE}
+# Bar plot by patient
+p_bar <- ggplot(cellratio) + 
+  geom_bar(aes(x = orig.ident, y = ratio, fill = Cell_type), stat = "identity", width = 0.7, size = 0.5, colour = '#222222') + 
+  # coord_flip() +
+  scale_fill_manual(values = my36colors) +
+  labs(x = 'Patient', y = 'Cell Ratio') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 0.5))
+p_bar
+ggsave(p_bar, filename = "../03.out/figure3/04.cellType_ratio.pdf", width = 18, height = 8)
+
+# Violin plots: all cells
+p_violin_all <- ggplot(cellratio, aes(x = Response, y = ratio, fill = Response)) + 
+  geom_violin(alpha = 0.5) +
+  geom_boxplot_jitter(width = 0.4, alpha = 0.75) + 
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  facet_wrap(. ~ Cell_type, scales = "free", nrow = 3) +
+  labs(y = "Cell Ratio") +
+  scale_fill_manual(values = c("#4292C6", "#A50F15")) +
+  stat_compare_means(comparisons = list(c("CR", "NCR")), method = "wilcox.test", label = "p.signif") +
+  theme_pubr() +
+  theme(legend.position = "none")
+p_violin_all
+# ggsave(p_violin_all, filename = "../03.out/figure3/04.cellType_diff_all.pdf", width = 16, height = 8)
+
+```
+
+## ARG24 Scores Across Cell Subtypes
+
+```{r fig3_riskscore_celltypes, eval=TRUE, message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+
+meta <- read.csv("../02.data/scaml.filter_meta.csv", header = T)
+# Define comparison
+my_comparisons <- list(c("CR", "NCR"))
+
+# Violin + boxplot with swarm
+p_risk_by_celltype <- ggplot(meta, aes(x = Response, y = sc_ARG24, fill = Response)) +
+  geom_violin(alpha = 0.6, width = 0.9, color = NA, trim = TRUE) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.4, color = "black") +
+  geom_quasirandom(width = 0.2, size = 0.4, alpha = 0.7, aes(color = Response), groupOnX = TRUE) +
+  stat_summary(fun = mean, geom = "point", shape = 21, size = 2, fill = "white", color = "black") +
+  stat_compare_means(comparisons = my_comparisons, label = "p.signif", size = 3) +
+  scale_fill_manual(values = c("CR" = "#4292C6", "NCR" = "#A50F15")) +
+  scale_color_manual(values = c("CR" = "#4292C6", "NCR" = "#A50F15")) +
+  facet_wrap(~ predicted_CellType_Broad, scales = "free_y", nrow = 3) +
+  labs(x = NULL, y = "ARG24 Risk Score") +
+  theme_classic(base_size = 10) +
+  theme(strip.text = element_text(face = "bold", size = 9),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+p_risk_by_celltype
+
+# ggsave(p_risk_by_celltype, filename = "../03.out/figure3/06.ARG24_diff_by_celltype.pdf", width = 16, height = 8)
+
+```
+
+## PCR Validation of ARG24 Score
+
+```{r fig3_pcr_riskscore_calc, eval=TRUE, message=FALSE, warning=FALSE}
+dat <- read.csv("../02.data/rjaml_qPCR_39.csv", header = TRUE, row.names = 1, check.names = FALSE)
+dat <- dat[, -1]
+
+gene.min <- read.csv("../02.data/24-gene_signature.csv", header = TRUE, row.names = 1, check.names = FALSE)
+genes <- row.names(gene.min)
+dat <- dat[, genes]
+
+# Compute LASSO-based risk scores
+calculate_risk_scores <- function(features, coefficients) {
+  scores <- sweep(features, 2, coefficients, `*`)
+  risk_scores <- rowSums(scores)
+  data.frame(risk_score = risk_scores)
+}
+
+rjaml_pcr <- calculate_risk_scores(dat, gene.min[, 1])
+clinidf <- read.csv("../02.data/rjaml_qPCR_39_clinical.csv", header = TRUE, row.names = 1, check.names = FALSE)
+clinidf <- clinidf[row.names(rjaml_pcr), ]
+
+df <- cbind(clinidf, rjaml_pcr)
+df$group <- ifelse(df$CR1_Response == "1", "NCR", "CR")
+
+```
+
+### Correlation Between RT-qPCR and RNA-seq ARG24 Scores
+
+```{r fig3_pcr_vs_rnaseq_correlation, eval=TRUE, message=FALSE, warning=FALSE}
+library(ggpubr)
+
+p_corr <- ggscatter(
+  na.omit(df[, c("risk_score", "RNAseq_ARG24")]), 
+  x = "risk_score", y = "RNAseq_ARG24",
+  alpha = 0.6, color = "black",
+  add = "reg.line",
+  add.params = list(color = "#377eb8", fill = "#cce5ff"),
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.coeff.args = list(method = "pearson", label.sep = "\n", label.x.npc = "left", label.y.npc = "top", size = 5)
+) +
+  theme_classic(base_size = 14) +
+  labs(x = "ARG24 Score (RT-qPCR)", y = "ARG24 Score (RNA-seq)") +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_corr
+
+# ggsave(p_corr, filename = "../03.out/figure3/08.pcr_vs_rnaseq_correlation.pdf", width = 4, height = 4)
+```
+
+### Risk Score Distribution in RT-qPCR Cohort
+
+```{r fig3_pcr_box_roc, eval=TRUE, message=FALSE, warning=FALSE}
+library(pROC)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+
+# Violin + boxplot
+p_box <- ggplot(df[, c("group", "risk_score")], aes(x = group, y = risk_score, color = group)) + 
+  geom_violin() +
+  geom_boxplot_jitter(width = 0.4, alpha = 0.75) +
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  theme_pubr() + 
+  xlab("") + ylab("ARG24 Risk Score") +
+  theme(strip.text.x = element_text(size = 13)) +
+  stat_compare_means(comparisons = list(c('CR', 'NCR')), method = 'wilcox.test') + 
+  scale_color_manual(values = c("#4292C6", "#A50F15")) +
+  theme(legend.position = 'none')
+
+p_box
+
+# ggsave(p_box, filename = "../03.out/figure3/09.pcr_riskscore_boxplot.pdf", width = 2.4, height = 3.8)
+
+# ROC Analysis
+auc_val <- auc(df$group, df$risk_score)
+roc_obj <- roc(df$group, df$risk_score)
+
+# pdf("../03.out/figure3/10.pcr_riskscore_roc.pdf", width = 3.8, height = 3.8)
+plot(smooth(roc_obj), col = brewer.pal(8, "Dark2")[7])
+legend("bottomright", legend = paste0("ARG24 AUC=", round(auc_val, 3)), col = brewer.pal(8, "Dark2")[7], lty = 1)
+title(main = "RT-qPCR Validation Cohort")
+# dev.off()
+```
+
+## D5-PBCR Evaluation in RT-qPCR Cohort
+
+```{r fig3_pcr_d5pbcr_box_roc, eval=TRUE, message=FALSE, warning=FALSE}
+library(pROC)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyverse)
+library(ggrastr)
+
+# Define D5-PBCR status group
+dat <- df[, c("D5_PBCR", "ARG24")]
+dat$D5_PBCR_group <- ifelse(dat$D5_PBCR == "1", "Positive", "Negative")
+
+# Boxplot comparing ARG24 scores by D5-PBCR status
+p_d5pbcr <- ggplot(dat, aes(x = D5_PBCR_group, y = ARG24, color = D5_PBCR_group)) + 
+  geom_violin() +
+  geom_boxplot_jitter(width = 0.4, alpha = 0.75) + 
+  geom_quasirandom_rast(width = 0.25, alpha = 0.5) +
+  theme_pubr() + 
+  xlab("") + ylab("ARG24 Risk Score") +
+  theme(strip.text.x = element_text(size = 13)) +
+  stat_compare_means(comparisons = list(c("Negative", "Positive")), method = "wilcox.test") + 
+  scale_color_manual(values = c("Negative" = "#4292C6", "Positive" = "#A50F15")) +
+  theme(legend.position = 'none')
+
+p_d5pbcr
+
+# ggsave(p_d5pbcr, filename = "../03.out/figure3/11.d5pbcr_riskscore_boxplot.pdf", width = 2.8, height = 3.8)
+
+# ROC Analysis for D5-PBCR
+auc_d5 <- auc(df$group, df$D5_PBCR)
+roc_d5 <- roc(df$group, df$D5_PBCR)
+
+# pdf("../03.out/figure3/12.d5pbcr_riskscore_roc.pdf", width = 3.8, height = 3.8)
+plot(roc_d5, col = brewer.pal(8, "Dark2")[8])
+legend("bottomright", legend = paste0("D5-PBCR AUC=", round(auc_d5, 3)), col = brewer.pal(8, "Dark2")[8], lty = 1)
+title(main = "RT-qPCR Validation Cohort")
+# dev.off()
+
+# Export combined clinical and risk score data
+# write.csv(df, "../02.data/rjaml_qPCR_39_clinical_ARG24.csv")
+```
